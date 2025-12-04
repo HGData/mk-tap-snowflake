@@ -276,6 +276,7 @@ class SnowflakeConnector(SQLConnector):
         full_table_name: str,
         stats: set[ProfileStats],
         profile_columns: list[str] | None = None,
+        where_clause: str | None = None,
     ) -> TableProfile:
         """Scan source system for a set of profile stats.
 
@@ -298,6 +299,12 @@ class SnowflakeConnector(SQLConnector):
         Note: Gathering stats can take a long time. The implementation should attempt
         to combine stats gathering into fewer tables scans where possible and only
         spend time pulling in requested stats.
+
+        Args:
+            full_table_name: Fully qualified table name.
+            stats: Set of profile statistics to collect.
+            profile_columns: List of column names to profile.
+            where_clause: Optional WHERE clause to filter the table (e.g., "col >= value").
 
         Returns:
             A TableProfile object. Stats may be left null if not requested, not
@@ -327,9 +334,14 @@ class SnowflakeConnector(SQLConnector):
                 expressions.append(f"count({col}) as nonnull__{col}")
             if ProfileStats.COLUMN_NULL_VALUES in stats:
                 expressions.append(f"count(1) - count({col}) as null__{col}")
+        
+        query = f"SELECT {', '.join(expressions)} FROM {full_table_name}"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+
         result_dict = (
             self.execute(
-                text(f"SELECT {', '.join(expressions)} FROM {full_table_name}"),
+                text(query),
             )
             .one()
             ._asdict()
@@ -374,39 +386,84 @@ class SnowflakeStream(SQLStream):
         This is a proposed replacement for the SDK internal SQLStream._sync_baches.
         Per: https://github.com/meltano/sdk/issues/976
 
-        This version stores the max replication value before batch sync starts, and then
-        increments the stream state with this value after the sync operation completes.
-
-        Since any FULL_TABLE sync operations may subsequently be run as INCREMENTAL,
-        the querying of the max value is not dependent upon running in INCREMENTAL mode.
+        This version preserves existing bookmarks, collects the max replication value
+        only from records that were actually synced (filtered by bookmark if it exists),
+        and increments the stream state with this value after the sync operation completes.
 
         Args:
             batch_config: The batch configuration.
             context: Stream partition or context dictionary.
         """
+        # Capture existing bookmark BEFORE _write_starting_replication_value
+        # Read directly from state like the SDK does, to avoid dependency on
+        # STARTING_MARKER which is only set after _write_starting_replication_value
+        # This ensures we preserve the bookmark even if
+        # _write_starting_replication_value tries to reset it
+        existing_bookmark = None
+        if self.replication_key:
+            state = self.get_context_state(context)
+            replication_key_value = state.get("replication_key_value")
+            if replication_key_value and self.replication_key == state.get(
+                "replication_key",
+            ):
+                # Keep the bookmark as-is from state
+                # (already JSON-compatible string/number)
+                existing_bookmark = replication_key_value
+
         self._write_starting_replication_value(context)
 
-        # New: Collect the max value for the replication column.
+        # Collect the max value for the replication column.
+        # If bookmark exists, only collect max from records >= bookmark
+        # (incremental sync). If no bookmark, collect max from entire table
+        # (first sync / full table).
         max_replication_key_value = None
         if self.replication_key:
-            table_profile: TableProfile = self.connector.get_table_profile(  # type: ignore[attr-defined]
-                full_table_name=self.fully_qualified_name,
-                stats={ProfileStats.COLUMN_MAX_VALUE},
-                profile_columns=[self.replication_key],
-            )
+            if existing_bookmark:
+                # Incremental sync: only get max from records that will be synced
+                # Format the bookmark value for SQL WHERE clause.
+                # State stores values as JSON-compatible strings, so we need to
+                # format them properly for SQL (handle strings, timestamps, numbers)
+                if self.is_timestamp_replication_key:
+                    # For timestamps, wrap in quotes (already a string from state)
+                    bookmark_str = f"'{existing_bookmark}'"
+                elif isinstance(existing_bookmark, str):
+                    # For string values, escape single quotes and wrap in quotes
+                    escaped = existing_bookmark.replace(chr(39), chr(39) + chr(39))
+                    bookmark_str = f"'{escaped}'"
+                else:
+                    # For numeric values, use as-is
+                    bookmark_str = str(existing_bookmark)
+
+                where_clause = f"{self.replication_key} >= {bookmark_str}"
+                table_profile: TableProfile = (
+                    self.connector.get_table_profile(  # type: ignore[attr-defined]
+                        full_table_name=self.fully_qualified_name,
+                        stats={ProfileStats.COLUMN_MAX_VALUE},
+                        profile_columns=[self.replication_key],
+                        where_clause=where_clause,
+                    )
+                )
+            else:
+                # First sync or full table: get max from entire table
+                table_profile = self.connector.get_table_profile(  # type: ignore[attr-defined]
+                    full_table_name=self.fully_qualified_name,
+                    stats={ProfileStats.COLUMN_MAX_VALUE},
+                    profile_columns=[self.replication_key],
+                )
+
             max_replication_key_value = table_profile.column_profiles[
                 self.replication_key
             ].max_value
 
-        # Not chanded: Note that the STATE messages will not have an incremented
-        # replication key value at this point.
+        # Sync batches
         with metrics.batch_counter(self.name, context=context) as counter:
             for encoding, manifest in self.get_batches(batch_config, context):
                 counter.increment()
                 self._write_batch_message(encoding=encoding, manifest=manifest)
                 self._write_state_message()
 
-        # New: Increment and emit the final STATE message after sync has completed.
+        # Increment and emit the final STATE message after sync has completed.
+        # Only update state if we have a max value (records were synced).
         if max_replication_key_value:
             self._increment_stream_state(
                 latest_record={
