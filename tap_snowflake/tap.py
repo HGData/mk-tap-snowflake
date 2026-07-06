@@ -110,6 +110,37 @@ class TapSnowflake(SQLTap):
                 "configuration parameter."
             ),
         ),
+        # ── Simulator mode (DRAFT — QA-291) ──────────────────────────────────
+        # Dev/test-only. When `simulator_base_url` is set (or the
+        # SIMULATOR_TAP_SNOWFLAKE_BASE_URL env var), discovery + record reads go
+        # over the Snowflake SQL API v2 against the RGIP connector simulator
+        # instead of the driver. Unset = normal driver path (fail-closed).
+        th.Property(
+            "simulator_base_url",
+            th.StringType,
+            required=False,
+            description=(
+                "DEV ONLY. Base URL of the RGIP Snowflake SQL API v2 simulator. "
+                "When set, the tap bypasses the Snowflake driver and reads over "
+                "REST. Never set in production."
+            ),
+        ),
+        th.Property(
+            "simulator_client_id",
+            th.StringType,
+            required=False,
+            secret=True,
+            description="DEV ONLY. OAuth client id for the simulator token endpoint.",
+        ),
+        th.Property(
+            "simulator_client_secret",
+            th.StringType,
+            required=False,
+            secret=True,
+            description=(
+                "DEV ONLY. OAuth client secret for the simulator token endpoint."
+            ),
+        ),
     ).to_dict()
     default_stream_class = SnowflakeStream
 

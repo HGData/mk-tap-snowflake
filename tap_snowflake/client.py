@@ -27,6 +27,12 @@ from singer_sdk.streams.core import REPLICATION_FULL_TABLE, REPLICATION_INCREMEN
 from snowflake.sqlalchemy import URL
 from sqlalchemy.sql import text
 
+from tap_snowflake.simulator import (
+    SnowflakeSimulatorClient,
+    build_catalog_entries,
+    load_simulator_config,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -90,6 +96,24 @@ class SnowflakeConnector(SQLConnector):
     """Connects to the Snowflake SQL source."""
 
     sql_to_jsonschema_converter = SnowflakeToJSONSchema
+
+    @cached_property
+    def simulator_client(self) -> SnowflakeSimulatorClient | None:
+        """A SQL API v2 client when simulator mode is enabled, else None.
+
+        DRAFT (QA-291). Fail-closed: returns None unless a simulator base URL is
+        configured (env `SIMULATOR_TAP_SNOWFLAKE_BASE_URL` or `simulator_base_url`
+        config), in which case the driver path is bypassed for discovery + reads.
+        """
+        config = load_simulator_config(dict(self.config))
+        if config is None:
+            return None
+        self.logger.info(
+            "tap-snowflake: SIMULATOR MODE enabled — reading from SQL API v2 sim at %s "
+            "(driver path bypassed). This must never be set in production.",
+            config.base_url,
+        )
+        return SnowflakeSimulatorClient(config)
 
     def get_private_key(self) -> bytes:
         """Get private key from the right location."""
@@ -216,6 +240,14 @@ class SnowflakeConnector(SQLConnector):
         Returns:
             The discovered catalog entries as a list.
         """
+        if self.simulator_client is not None:
+            # Simulator mode: reflect over the SQL API v2 instead of the driver.
+            return build_catalog_entries(
+                self.simulator_client,
+                self.config.get("database"),
+                self.config.get("tables"),
+            )
+
         result: list[dict] = []
         tables = [t.lower() for t in self.config.get("tables", [])]
         engine = self.create_engine()
@@ -633,6 +665,40 @@ class SnowflakeStream(SQLStream):
 
     # Get records from stream
     # Overridden to use native objects under `if start_val:`
+    def _get_records_via_simulator(
+        self,
+        context: types.Context | None,
+    ) -> Iterable[dict[str, Any]]:
+        """DRAFT (QA-291): read records over the SQL API v2 simulator.
+
+        Builds the same SELECT the SQLAlchemy record path would (selected
+        columns, incremental replication-key filter + ordering) and runs it
+        over REST. Record mode only — the internal-stage batch path
+        (`get_batches_from_internal_user_stage`) is not simulatable over SQL
+        API v2 and must stay disabled (no `batch_config`) in simulator runs.
+        """
+        client = self.connector.simulator_client  # type: ignore[attr-defined]
+        assert client is not None  # noqa: S101 — guarded by caller
+
+        selected = list(self.get_selected_schema()["properties"].keys())
+        col_list = ", ".join(selected) if selected else "*"
+        sql = f"SELECT {col_list} FROM {self.fully_qualified_name}"
+
+        clause = ""
+        if self.replication_key:
+            start_val = self.get_starting_replication_key_value(context)
+            if start_val is not None:
+                # DRAFT: inline literal (escaped). Switch to SQL API v2 bindings
+                # once the sim's binding support is confirmed. See docs.
+                literal = str(start_val).replace("'", "''")
+                clause += f" WHERE {self.replication_key} >= '{literal}'"
+            clause += f" ORDER BY {self.replication_key}"
+
+        if self.ABORT_AT_RECORD_COUNT is not None:
+            clause += f" LIMIT {self.ABORT_AT_RECORD_COUNT}"
+
+        yield from client.execute_dicts(f"{sql}{clause}")
+
     def get_records(self, context: types.Context | None) -> Iterable[dict[str, Any]]:
         """Return a generator of record-type dictionary objects.
 
@@ -654,6 +720,10 @@ class SnowflakeStream(SQLStream):
         if context:
             msg = f"Stream '{self.name}' does not support partitioning."
             raise NotImplementedError(msg)
+
+        if self.connector.simulator_client is not None:  # type: ignore[attr-defined]
+            yield from self._get_records_via_simulator(context)
+            return
 
         selected_column_names = self.get_selected_schema()["properties"].keys()
         table = self.connector.get_table(

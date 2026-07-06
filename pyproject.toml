@@ -53,6 +53,13 @@ select = ["ALL"]
 quote-style = "double"
 exclude = ["*.pyi"]
 
+[tool.ruff.lint.per-file-ignores]
+# Hand-written pytest modules under `select = ["ALL"]`: allow asserts, test
+# credentials, magic-value comparisons, fixture-signature args, and relax
+# docstring requirements. (Added for QA-291 — the existing suite used the SDK's
+# generated test class, which sidesteps these; unit tests need the exemption.)
+"tests/**" = ["S101", "S105", "S106", "D100", "D101", "D103", "ARG001", "PLR2004"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["target_snowflake"]
 
