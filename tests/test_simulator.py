@@ -146,6 +146,64 @@ def test_execute_raises_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
         _client().execute("SELECT 1")
 
 
+# ── async lifecycle (202 RUNNING → poll → SUCCEEDED) ─────────────────────────
+def test_execute_polls_until_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 202 POST must be polled until SUCCEEDED, then results read (not 0 rows)."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        # Accepted but still executing — body carries no results.
+        return _FakeResponse({"statementHandle": "h9", "status": "RUNNING"}, status=202)
+
+    calls = {"n": 0}
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        assert url.endswith("/api/v2/statements/h9")
+        calls["n"] += 1
+        if calls["n"] < 3:  # RUNNING twice, then SUCCEEDED
+            return _FakeResponse({"status": "RUNNING"}, status=202)
+        return _FakeResponse(
+            {
+                "status": "SUCCEEDED",
+                "statementHandle": "h9",
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [{"rowCount": 2}],
+                },
+                "data": [[1], [2]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    monkeypatch.setattr(sim.requests, "get", fake_get)
+    monkeypatch.setattr(sim.time, "sleep", lambda _s: None)
+
+    cols, rows = _client().execute("SELECT A FROM T")
+    assert cols == ["A"]
+    assert rows == [[1], [2]]
+    assert calls["n"] == 3
+
+
+def test_execute_poll_terminal_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal status (e.g. 422 ABORTED/FAILED) during polling must raise."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse({"statementHandle": "h9", "status": "RUNNING"}, status=202)
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse({"message": "cancelled"}, status=422)
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    monkeypatch.setattr(sim.requests, "get", fake_get)
+    monkeypatch.setattr(sim.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="failed while polling"):
+        _client().execute("SELECT 1")
+
+
 # ── discovery ────────────────────────────────────────────────────────────────
 def test_build_catalog_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_post(url: str, **kwargs: Any) -> _FakeResponse:

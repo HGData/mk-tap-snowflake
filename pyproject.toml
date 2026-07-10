@@ -21,6 +21,10 @@ singer-sdk = "~=0.52.4"
 snowflake-sqlalchemy = "1.7.7"
 snowflake-connector-python = { version = "~=3.17.4", extras = ["secure-local-storage"] }
 sqlalchemy = "~=2.0.43"
+# Used by the dev-only simulator (SQL API v2) mode in tap_snowflake/simulator.py.
+# Already resolved transitively (via snowflake-connector-python) at 2.32.3; declared
+# here as a direct dependency. Run `poetry lock --no-update` to refresh lock metadata.
+requests = ">=2.31,<3"
 
 [tool.poetry.group.dev.dependencies]
 mypy = ">=1.17"

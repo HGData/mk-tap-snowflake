@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import requests
@@ -47,6 +49,7 @@ ENV_CLIENT_SECRET_FALLBACK = "TAP_SNOWFLAKE_CLIENT_SECRET"  # noqa: S105 — env
 
 _HTTP_TIMEOUT_S = 60
 _STATEMENT_TIMEOUT_S = 300
+_POLL_INTERVAL_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -170,9 +173,12 @@ class SnowflakeSimulatorClient:
     def execute(self, statement: str) -> tuple[list[str], list[list[Any]]]:
         """Run a SQL statement and return (column_names, rows).
 
-        Handles the SQL API v2 partitioned result set: partition 0 arrives inline
-        in the POST response; any further partitions are fetched with
-        GET /api/v2/statements/{handle}?partition=N.
+        Handles the SQL API v2 async lifecycle: a statement that does not finish
+        within the synchronous window returns 202 RUNNING (with a
+        statementStatusUrl) — poll GET /api/v2/statements/{handle} until it
+        SUCCEEDED before reading. Then the partitioned result set: partition 0
+        arrives inline in the (final) response; any further partitions are fetched
+        with GET /api/v2/statements/{handle}?partition=N.
         """
         url = f"{self._config.base_url}/api/v2/statements"
         body: dict[str, Any] = {
@@ -203,6 +209,24 @@ class SnowflakeSimulatorClient:
             raise RuntimeError(msg)
         payload = resp.json()
 
+        # Async lifecycle: 202 (or status RUNNING) means the statement is still
+        # executing and the body carries no results yet — poll until SUCCEEDED.
+        # (The driver path handles this natively; the REST path must poll, else a
+        # slow/async statement silently yields zero rows.)
+        still_running = (
+            resp.status_code == HTTPStatus.ACCEPTED
+            or payload.get("status") == "RUNNING"
+        )
+        if still_running:
+            handle = payload.get("statementHandle")
+            if not handle:
+                msg = (
+                    "Simulator returned RUNNING without a statementHandle to poll "
+                    f"for {statement!r}: {resp.text}"
+                )
+                raise RuntimeError(msg)
+            payload = self._poll_until_succeeded(handle)
+
         meta = payload.get("resultSetMetaData", {})
         columns = [c["name"] for c in meta.get("rowType", [])]
         rows: list[list[Any]] = list(payload.get("data", []) or [])
@@ -213,6 +237,35 @@ class SnowflakeSimulatorClient:
             rows.extend(self._fetch_partition(handle, idx))
 
         return columns, rows
+
+    def _poll_until_succeeded(self, handle: str) -> dict[str, Any]:
+        """Poll GET /api/v2/statements/{handle} until the statement completes.
+
+        Returns the SUCCEEDED response body (metadata + partition 0 data). Raises
+        on a terminal non-success status or once _STATEMENT_TIMEOUT_S elapses.
+        While RUNNING the SQL API returns 202; on completion, 200 with results.
+        """
+        url = f"{self._config.base_url}/api/v2/statements/{handle}"
+        deadline = time.monotonic() + _STATEMENT_TIMEOUT_S
+        while True:
+            resp = requests.get(url, headers=self._headers(), timeout=_HTTP_TIMEOUT_S)
+            if resp.status_code == HTTPStatus.OK:
+                return resp.json()
+            if resp.status_code == HTTPStatus.ACCEPTED:
+                if time.monotonic() >= deadline:
+                    msg = (
+                        f"Simulator statement {handle} still RUNNING after "
+                        f"{_STATEMENT_TIMEOUT_S}s — giving up."
+                    )
+                    raise RuntimeError(msg)
+                time.sleep(_POLL_INTERVAL_S)
+                continue
+            # Any other status (e.g. 422 ABORTED/FAILED) is terminal.
+            msg = (
+                f"Simulator statement {handle} failed while polling "
+                f"({resp.status_code}): {resp.text}"
+            )
+            raise RuntimeError(msg)
 
     def _fetch_partition(self, handle: str | None, partition: int) -> list[list[Any]]:
         if not handle:
