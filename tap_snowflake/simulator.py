@@ -289,7 +289,7 @@ class SnowflakeSimulatorClient:
         """Run a statement and yield one dict per row keyed by column name."""
         columns, rows = self.execute(statement)
         for row in rows:
-            yield dict(zip(columns, row))
+            yield dict(zip(columns, row, strict=False))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
