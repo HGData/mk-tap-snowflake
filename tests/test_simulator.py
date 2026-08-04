@@ -119,6 +119,63 @@ def test_execute_parses_columns_and_pages_partitions(
     assert posts[0]["database"] == "CUSTOMER_DB"
 
 
+def test_execute_raises_on_multi_partition_without_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-partition result with no handle must fail, not short-read.
+
+    Partition 0 is inline; 1..N need the statementHandle. Returning only
+    partition 0 would look like "the source has less data than expected"
+    instead of an error.
+    """
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                # no statementHandle, but three partitions advertised
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [
+                        {"rowCount": 1},
+                        {"rowCount": 1},
+                        {"rowCount": 1},
+                    ],
+                },
+                "data": [["only-partition-0"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    with pytest.raises(RuntimeError, match="no statementHandle to page them"):
+        _client().execute("SELECT A FROM CUSTOMER_DB.PUBLIC.EVENTS")
+
+
+def test_execute_single_partition_without_handle_is_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-partition result needs no handle — it is inline. Must not raise."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [{"rowCount": 1}],
+                },
+                "data": [["v"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    cols, rows = _client().execute("SELECT A FROM CUSTOMER_DB.PUBLIC.EVENTS")
+    assert cols == ["A"]
+    assert rows == [["v"]]
+
+
 def test_execute_dicts_zips_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
         if url.endswith("/oauth/token-request"):

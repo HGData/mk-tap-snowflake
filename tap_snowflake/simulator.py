@@ -233,6 +233,17 @@ class SnowflakeSimulatorClient:
 
         handle = payload.get("statementHandle")
         partitions = meta.get("partitionInfo", []) or []
+        # Partition 0 arrives inline; 1..N need the handle. Without it we would
+        # silently return only partition 0 — a short read presenting as "the
+        # source has less data than expected" rather than as an error. Fail loudly
+        # instead, mirroring the RUNNING-without-a-handle guard above.
+        if len(partitions) > 1 and not handle:
+            msg = (
+                f"Simulator returned {len(partitions)} partitions but no "
+                f"statementHandle to page them for {statement!r}; refusing to "
+                "return a partial result set."
+            )
+            raise RuntimeError(msg)
         for idx in range(1, len(partitions)):
             rows.extend(self._fetch_partition(handle, idx))
 
