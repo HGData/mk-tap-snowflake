@@ -363,7 +363,12 @@ def build_catalog_entries(
 
     entries: list[dict[str, Any]] = []
     for (schema, table), cols in grouped.items():
-        stream_id = f"{database}-{schema}-{table}"
+        # Must match the driver path exactly, or select rules / stream_maps /
+        # stored catalogs stop matching in simulator mode. singer-sdk builds it
+        # as `{schema}-{table}` with no database prefix (SQLConnector
+        # .discover_catalog_entry: `f"{schema_name}-{table_name}"`), and this
+        # repo's own fixtures agree (tests/catalog.json: "tpch_sf1-customer").
+        stream_id = f"{schema}-{table}"
         properties = {col: snowflake_type_to_jsonschema(dtype) for col, dtype in cols}
         column_metadata = [
             {

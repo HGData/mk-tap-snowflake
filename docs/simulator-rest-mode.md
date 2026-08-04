@@ -78,10 +78,15 @@ Ordered roughly by how much they could change the approach.
 2. **Discovery: runtime vs catalog.** Does the MDI run do runtime discovery, or
    pass a stored `--catalog`? If a catalog is supplied, `build_catalog_entries` is
    moot and we can drop it. If runtime, then:
-   - **Stream-id format** — I used `{database}-{schema}-{table}` (the SDK's SQL
-     convention). Must match what production driver discovery emits, or `select`
-     rules / `stream_maps` / dbt keys drift. Please confirm the exact casing/format
-     from a real discovered catalog.
+   - **Stream-id format** — RESOLVED. It is `{schema}-{table}`, no database
+     prefix. The driver path goes through singer-sdk's
+     `SQLConnector.discover_catalog_entry`, which builds
+     `f"{schema_name}-{table_name}"` (`singer_sdk/sql/connector.py`), and this
+     repo's own fixtures agree (`tests/catalog.json`: `tpch_sf1-customer`).
+     An earlier draft of this file used `{database}-{schema}-{table}`; that was
+     wrong and would have silently broken `select` rules / `stream_maps` / dbt
+     keys in simulator mode. The database is still emitted as `database-name`
+     stream metadata.
    - **Type map** (`snowflake_type_to_jsonschema`) is coarse — confirm it matches
      the real discovery output for the columns in play.
    - **Key/replication metadata** — I emit empty `key_properties`; confirm what

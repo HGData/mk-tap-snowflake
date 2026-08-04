@@ -232,10 +232,16 @@ def test_build_catalog_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     entries = sim.build_catalog_entries(_client(), database="CUSTOMER_DB")
 
     by_id = {e["tap_stream_id"]: e for e in entries}
-    assert set(by_id) == {"CUSTOMER_DB-PUBLIC-CONTACTS", "CUSTOMER_DB-PUBLIC-EVENTS"}
-    events = by_id["CUSTOMER_DB-PUBLIC-EVENTS"]
+    # `{schema}-{table}` — no database prefix — matching what singer-sdk's
+    # SQLConnector.discover_catalog_entry emits on the driver path. Getting this
+    # wrong is silent: select rules and stream_maps simply stop matching.
+    assert set(by_id) == {"PUBLIC-CONTACTS", "PUBLIC-EVENTS"}
+    events = by_id["PUBLIC-EVENTS"]
     assert events["schema"]["properties"]["EVENT_TIMESTAMP"]["format"] == "date-time"
     assert events["table_name"] == "EVENTS"
+    # The database is still carried in metadata even though it is not in the id.
+    root = next(m for m in events["metadata"] if m["breadcrumb"] == [])
+    assert root["metadata"]["database-name"] == "CUSTOMER_DB"
 
 
 def test_build_catalog_entries_requires_database() -> None:
