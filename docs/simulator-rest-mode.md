@@ -57,8 +57,11 @@ Files:
 
 ### Validated so far
 
-- `ruff check` + `ruff format` clean; 10 offline unit tests pass
+- `ruff check` + `ruff format` clean; **12** offline unit tests pass
   (`pytest tests/test_simulator.py`). No live sim or Snowflake required.
+- Verified on the `fix/preserve-bookmarks-incremental-sync` base (the ref MDI
+  pins): 12/12 pass against singer-sdk 0.52.4, and `pip install` of the branch
+  imports `tap_snowflake.client` with only declared dependencies present.
 - **Not** yet run end-to-end against the real simulator or through Meltano.
 
 ---
@@ -111,12 +114,23 @@ Ordered roughly by how much they could change the approach.
    `data`, `resultSetMetaData.partitionInfo[]`, `statementHandle`, and pages
    partitions via `GET /statements/{handle}?partition=N`. You validated the
    partition-fetch round trip in PR #64 — confirm these field names match the
-   sim's actual response. Also: does the sim ever return **202/async** for these
-   queries, or always 200 sync? (This draft assumes sync.)
+   sim's actual response.
+   **202/async: RESOLVED — the sim can return it, and `execute` now handles it.**
+   `polls_until_complete` is a per-tenant simulator setting: tenant 1002 (the
+   MDI-tap tenant) sets it to 0 so statements return 200 SUCCEEDED
+   synchronously, while tenant 1001 keeps 2 and exercises the async path. So
+   `execute` does not assume sync — it polls `GET /statements/{handle}` via
+   `_poll_until_succeeded` until SUCCEEDED, bounded by `_STATEMENT_TIMEOUT_S`,
+   and raises on a terminal status. Both paths have unit coverage.
+   *Still open:* the token is cached for the client's lifetime and `expires_in`
+   is ignored, so a long extraction could hit a 401 with no retry — fine for
+   short CI pulls, worth hardening before any large one.
 
-7. **`requests` dependency.** The client uses `requests` (available transitively
-   via singer-sdk / snowflake-connector-python). Before merge it should be a
-   declared dependency in `pyproject.toml` + `poetry.lock`.
+7. **`requests` dependency.** DONE — declared in `pyproject.toml` and recorded in
+   `poetry.lock` (main group). Note `poetry.lock` is only used by `poetry
+   install` for local dev; MDI installs with pip from a git ref, which reads the
+   built wheel metadata (`Requires-Dist: requests (>=2.31,<3)`) — verified by
+   building the wheel and pip-installing it into a clean venv.
 
 8. **Networking / TLS.** The dev pull ECS task must reach the snowflake-sim ALB
    over HTTPS with a valid cert (same egress the SF/HubSpot sims got —
