@@ -669,13 +669,26 @@ class SnowflakeStream(SQLStream):
         self,
         context: types.Context | None,
     ) -> Iterable[dict[str, Any]]:
-        """DRAFT (QA-291): read records over the SQL API v2 simulator.
+        r"""DRAFT (QA-291): read records over the SQL API v2 simulator.
 
         Builds the same SELECT the SQLAlchemy record path would (selected
         columns, incremental replication-key filter + ordering) and runs it
         over REST. Record mode only — the internal-stage batch path
         (`get_batches_from_internal_user_stage`) is not simulatable over SQL
         API v2 and must stay disabled (no `batch_config`) in simulator runs.
+
+        LIMITATION (QA-291 follow-up (e)): identifiers are interpolated
+        UNQUOTED. `simulator.normalize_identifier` faithfully preserves an
+        identifier that needs quoting (`eventId`, `HAS-DASH`, a reserved word),
+        but this SELECT would then emit it bare and Snowflake would resolve it
+        to the upper-cased form — the wrong column. Unreachable today: the
+        simulator serves only `CUSTOMER_DB.PUBLIC.{CONTACTS,EVENTS}` with legal
+        upper-case identifiers, so nothing quote-requiring can arrive. Fixing it
+        properly means denormalizing and running each component through the
+        dialect's identifier preparer here, AND widening the simulator's query
+        router, whose `\bfrom\b\s+([\w.]+)` regex does not match quoted names —
+        so quoting unilaterally would misroute reads. Two repos, tracked
+        separately rather than done as a drive-by.
         """
         client = self.connector.simulator_client  # type: ignore[attr-defined]
         assert client is not None  # noqa: S101 — guarded by caller

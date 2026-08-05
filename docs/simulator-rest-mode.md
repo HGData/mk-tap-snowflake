@@ -64,10 +64,13 @@ Files:
 
 ### Validated so far
 
-- `ruff check` + `ruff format` clean; **26** offline unit tests pass
-  (`pytest tests/test_simulator.py`). No live sim or Snowflake required.
+- `ruff check` + `ruff format` clean; **29** offline unit tests pass
+  (`pytest tests/test_simulator.py`). No network, live simulator or Snowflake
+  account required — but the package's own declared dependencies must be
+  installed, since `simulator.py` now imports `snowflake-sqlalchemy` for the
+  identifier normalizer (`client.py` already imported it unconditionally).
 - Verified on the `fix/preserve-bookmarks-incremental-sync` base (the ref MDI
-  pins): 26/26 pass against singer-sdk 0.52.4, and `pip install` of the branch
+  pins): 29/29 pass against singer-sdk 0.52.4, and `pip install` of the branch
   imports `tap_snowflake.client` with only declared dependencies present.
 - Proven live in-cluster against the deployed simulator on 2026-08-05
   (rgip-connector-tests run 30997514181): OAuth mint, discovery, stream ids, and
@@ -102,9 +105,13 @@ Ordered roughly by how much they could change the approach.
      keys in simulator mode. The database is still emitted as `database-name`
      stream metadata.
    - **Identifier case** — RESOLVED, the hard way. Every identifier published
-     from simulator mode is case-normalized (`normalize_identifier`): an
-     all-upper name is lower-cased, a mixed-case (i.e. quoted) one is left
-     alone. This mirrors snowflake-sqlalchemy's `normalize_name`, which the
+     from simulator mode goes through `normalize_identifier`, which **delegates
+     to snowflake-sqlalchemy's own `SnowflakeDialect.normalize_name`** rather
+     than reimplementing it. The rule is subtler than "lower-case if
+     upper-case": an all-upper name is lower-cased *only if the lower-cased form
+     would not require quoting*, so `HAS-DASH` and reserved words like `SELECT`
+     survive unchanged, and an all-lower name returns as `quoted_name(...,
+     quote=True)`. Delegating makes drift impossible. This mirrors what the
      driver path applies before singer-sdk ever sees a name — so prod stream ids
      read `madkudu_reverse_etl-madkudu_events_table`, not the upper-case form
      Snowflake actually stores. mk-airflow keys `TAP_SNOWFLAKE__SELECT` and
@@ -115,6 +122,18 @@ Ordered roughly by how much they could change the approach.
      were `slack_onboarding-*`, both streams were deselected, and the run wrote
      0 rows while the DAG reported success. Record keys are normalized too, or
      they would not match the properties discovery declares.
+   - **Quoting on the read path** — OPEN, follow-up (e). Normalization correctly
+     *preserves* an identifier that needs quoting, but
+     `_get_records_via_simulator` interpolates identifiers **unquoted**, so a
+     stream named `eventId` would go out bare and Snowflake would resolve it to
+     `EVENTID`. Unreachable via the simulator, which serves only
+     `CUSTOMER_DB.PUBLIC.{CONTACTS,EVENTS}` with legal upper-case identifiers.
+     Fixing it means denormalizing + running each component through the dialect's
+     identifier preparer here **and** widening the simulator's query router
+     (`generator.py` `detect_query_type`), whose `\bfrom\b\s+([\w.]+)` regex does
+     not match quoted names — quoting only one side would misroute reads. Two
+     repos; raised by Copilot on PR #3 and tracked rather than done as a
+     drive-by.
    - **Type map** (`snowflake_type_to_jsonschema`) is coarse — confirm it matches
      the real discovery output for the columns in play.
    - **Key/replication metadata** — I emit empty `key_properties`; confirm what

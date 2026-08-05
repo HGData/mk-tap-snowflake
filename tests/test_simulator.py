@@ -270,10 +270,17 @@ def test_execute_dicts_keys_match_discovered_properties(
     [
         ("PUBLIC", "public"),
         ("EVENT_ID", "event_id"),
+        ("CUSTOMER_DB", "customer_db"),
         ("already_lower", "already_lower"),
         # Mixed case means the identifier was created quoted, so Snowflake
         # preserves it and so must we — lower-casing it would break the lookup.
         ("MixedCase", "MixedCase"),
+        # The rule is NOT "lower-case if upper-case": an all-upper name is only
+        # lower-cased when the lower-cased form would not require quoting. A
+        # dash is not a legal bare identifier character and `SELECT` is
+        # reserved, so both stay as-is on the driver path — and must here.
+        ("HAS-DASH", "HAS-DASH"),
+        ("SELECT", "SELECT"),
         ("", ""),
     ],
 )
@@ -399,10 +406,18 @@ def test_build_catalog_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     assert crumbs == {("properties", "event_id"), ("properties", "event_timestamp")}
 
 
-def test_build_catalog_entries_preserves_quoted_mixed_case(
+def test_build_catalog_entries_preserves_quoted_mixed_case_in_the_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mixed-case identifier was created quoted — normalizing it would break it."""
+    """A mixed-case identifier was created quoted — normalizing it would break it.
+
+    CATALOG-LEVEL ONLY. Preserving the name here is necessary but not sufficient:
+    `_get_records_via_simulator` interpolates identifiers unquoted, so a read of
+    this stream would still emit bare `eventId`. See the LIMITATION note on that
+    method (QA-291 follow-up (e)). Unreachable via the simulator, which serves
+    only legal upper-case identifiers — this test pins the discovery half of the
+    contract, and deliberately does not claim the read half works.
+    """
 
     def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
         if url.endswith("/oauth/token-request"):

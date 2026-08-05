@@ -37,9 +37,15 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import requests
+from snowflake.sqlalchemy.snowdialect import SnowflakeDialect
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
+
+# Instantiated once: `normalize_name` is pure and needs no connection, but the
+# dialect carries the identifier preparer (legal characters + reserved words)
+# that the rule depends on. See `normalize_identifier`.
+_SNOWFLAKE_DIALECT = SnowflakeDialect()
 
 # Env var names. These are the keys the tests-repo override entry writes into
 # mdi_simulator_overrides[<tenant>].snowflake, and what mk-airflow copies onto
@@ -92,9 +98,8 @@ def normalize_identifier(name: str) -> str:
 
     Snowflake stores unquoted identifiers upper-cased and reports them that way
     through INFORMATION_SCHEMA and result metadata. The driver path never
-    surfaces that casing: snowflake-sqlalchemy's `normalize_name` lower-cases an
-    all-upper identifier (and leaves a genuinely mixed-case, i.e. quoted, one
-    alone), and singer-sdk builds catalog entries from those normalized names.
+    surfaces that casing: snowflake-sqlalchemy's `normalize_name` runs first, and
+    singer-sdk builds catalog entries from the normalized names.
 
     Simulator mode reads the same identifiers straight off the SQL API JSON, so
     without this it emits `PUBLIC-EVENTS` where the driver emits `public-events`.
@@ -103,8 +108,21 @@ def normalize_identifier(name: str) -> str:
     `f"{schema.lower()}-{table.lower()}"`, so an upper-cased stream id matches no
     select rule, every stream is deselected, and the pull writes zero rows while
     the DAG reports success.
+
+    We delegate to the dialect rather than reimplement it. The rule is subtler
+    than "lower-case if upper-case": `name_utils.normalize_name` lower-cases an
+    all-upper name *only when the lower-cased form would not require quoting*, so
+    `HAS-DASH` and reserved words like `SELECT` stay as they are, and an
+    all-lower name comes back as a `quoted_name(..., quote=True)`. Reproducing
+    that here would duplicate the preparer's legal-character rules and reserved
+    word list, and drift from them. snowflake-sqlalchemy is a pinned dependency
+    already imported unconditionally by `client.py`, so this costs nothing.
+
+    The return value keeps whatever the dialect produced, including
+    `quoted_name`'s quoting flag — see the read-path caveat on
+    `_get_records_via_simulator`, which does not yet honour it.
     """
-    return name.lower() if name.isupper() else name
+    return _SNOWFLAKE_DIALECT.normalize_name(name)
 
 
 def load_simulator_config(config: dict[str, Any] | None) -> SimulatorConfig | None:
