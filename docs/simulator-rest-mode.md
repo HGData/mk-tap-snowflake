@@ -64,12 +64,16 @@ Files:
 
 ### Validated so far
 
-- `ruff check` + `ruff format` clean; **19** offline unit tests pass
+- `ruff check` + `ruff format` clean; **26** offline unit tests pass
   (`pytest tests/test_simulator.py`). No live sim or Snowflake required.
 - Verified on the `fix/preserve-bookmarks-incremental-sync` base (the ref MDI
-  pins): 19/19 pass against singer-sdk 0.52.4, and `pip install` of the branch
+  pins): 26/26 pass against singer-sdk 0.52.4, and `pip install` of the branch
   imports `tap_snowflake.client` with only declared dependencies present.
-- **Not** yet run end-to-end against the real simulator or through Meltano.
+- Proven live in-cluster against the deployed simulator on 2026-08-05
+  (rgip-connector-tests run 30997514181): OAuth mint, discovery, stream ids, and
+  60,647 rows stitched across 3 partitions.
+- Run end-to-end through Meltano/MDI on 2026-08-05 (tenant 426134). That run
+  surfaced the identifier-case defect fixed here — see below.
 
 ---
 
@@ -97,6 +101,20 @@ Ordered roughly by how much they could change the approach.
      wrong and would have silently broken `select` rules / `stream_maps` / dbt
      keys in simulator mode. The database is still emitted as `database-name`
      stream metadata.
+   - **Identifier case** — RESOLVED, the hard way. Every identifier published
+     from simulator mode is case-normalized (`normalize_identifier`): an
+     all-upper name is lower-cased, a mixed-case (i.e. quoted) one is left
+     alone. This mirrors snowflake-sqlalchemy's `normalize_name`, which the
+     driver path applies before singer-sdk ever sees a name — so prod stream ids
+     read `madkudu_reverse_etl-madkudu_events_table`, not the upper-case form
+     Snowflake actually stores. mk-airflow keys `TAP_SNOWFLAKE__SELECT` and
+     `MELTANO_MAP_TRANSFORMER_STREAM_MAPS` off `f"{schema.lower()}-{table.lower()}"`
+     (`dags/lib/data_ingestion/config.py`), so an upper-cased stream id matches
+     no select rule. The first MDI E2E (tenant 426134, 2026-08-05) hit exactly
+     that: discovery found `PUBLIC-EVENTS`/`PUBLIC-CONTACTS`, the select rules
+     were `slack_onboarding-*`, both streams were deselected, and the run wrote
+     0 rows while the DAG reported success. Record keys are normalized too, or
+     they would not match the properties discovery declares.
    - **Type map** (`snowflake_type_to_jsonschema`) is coarse — confirm it matches
      the real discovery output for the columns in play.
    - **Key/replication metadata** — I emit empty `key_properties`; confirm what

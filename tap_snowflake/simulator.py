@@ -87,6 +87,26 @@ def _first(*values: str | None) -> str | None:
     return None
 
 
+def normalize_identifier(name: str) -> str:
+    """Case-normalize a Snowflake identifier the way the driver path does.
+
+    Snowflake stores unquoted identifiers upper-cased and reports them that way
+    through INFORMATION_SCHEMA and result metadata. The driver path never
+    surfaces that casing: snowflake-sqlalchemy's `normalize_name` lower-cases an
+    all-upper identifier (and leaves a genuinely mixed-case, i.e. quoted, one
+    alone), and singer-sdk builds catalog entries from those normalized names.
+
+    Simulator mode reads the same identifiers straight off the SQL API JSON, so
+    without this it emits `PUBLIC-EVENTS` where the driver emits `public-events`.
+    That difference is silent and fatal: mk-airflow derives both
+    `TAP_SNOWFLAKE__SELECT` and `MELTANO_MAP_TRANSFORMER_STREAM_MAPS` from
+    `f"{schema.lower()}-{table.lower()}"`, so an upper-cased stream id matches no
+    select rule, every stream is deselected, and the pull writes zero rows while
+    the DAG reports success.
+    """
+    return name.lower() if name.isupper() else name
+
+
 def load_simulator_config(config: dict[str, Any] | None) -> SimulatorConfig | None:
     """Build the simulator config from tap config + env, or None if disabled.
 
@@ -330,10 +350,17 @@ class SnowflakeSimulatorClient:
         return list(resp.json().get("data", []) or [])
 
     def execute_dicts(self, statement: str) -> Iterator[dict[str, Any]]:
-        """Run a statement and yield one dict per row keyed by column name."""
+        """Run a statement and yield one dict per row keyed by column name.
+
+        Keys are normalized (see `normalize_identifier`) so they match the
+        property names `build_catalog_entries` published for the stream. Skipping
+        that here would emit `EVENT_ID` against a schema declaring `event_id` —
+        every record would fail its own schema.
+        """
         columns, rows = self.execute(statement)
+        keys = [normalize_identifier(c) for c in columns]
         for row in rows:
-            yield dict(zip(columns, row, strict=False))
+            yield dict(zip(keys, row, strict=False))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,8 +368,8 @@ class SnowflakeSimulatorClient:
 #
 # DRAFT / needs-confirmation (see docs): reproduces enough of the SDK's
 # SQLAlchemy-reflection discovery to build a Singer catalog from the simulator.
-# The catalog dict shape, stream-id format ({db}-{schema}-{table}), and the
-# Snowflake→JSON type map below must match what production driver-based
+# The catalog dict shape, stream-id format ({schema}-{table}, case-normalized),
+# and the Snowflake→JSON type map below must match what production driver-based
 # discovery emits, or downstream `select` rules / stream_maps / dbt keys drift.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -407,16 +434,26 @@ def build_catalog_entries(
 
     entries: list[dict[str, Any]] = []
     for (schema, table), cols in grouped.items():
+        # Every identifier published here is case-normalized, because the driver
+        # path publishes normalized names and downstream keys off them. See
+        # `normalize_identifier`. The raw casing is only used to talk to the
+        # simulator (above); it never leaves this function.
+        schema_name = normalize_identifier(schema)
+        table_name = normalize_identifier(table)
+        database_name = normalize_identifier(database)
         # Must match the driver path exactly, or select rules / stream_maps /
         # stored catalogs stop matching in simulator mode. singer-sdk builds it
         # as `{schema}-{table}` with no database prefix (SQLConnector
         # .discover_catalog_entry: `f"{schema_name}-{table_name}"`), and this
         # repo's own fixtures agree (tests/catalog.json: "tpch_sf1-customer").
-        stream_id = f"{schema}-{table}"
-        properties = {col: snowflake_type_to_jsonschema(dtype) for col, dtype in cols}
+        stream_id = f"{schema_name}-{table_name}"
+        properties = {
+            normalize_identifier(col): snowflake_type_to_jsonschema(dtype)
+            for col, dtype in cols
+        }
         column_metadata = [
             {
-                "breadcrumb": ["properties", col],
+                "breadcrumb": ["properties", normalize_identifier(col)],
                 "metadata": {"inclusion": "available", "selected-by-default": True},
             }
             for col, _ in cols
@@ -424,7 +461,7 @@ def build_catalog_entries(
         entries.append(
             {
                 "tap_stream_id": stream_id,
-                "table_name": table,
+                "table_name": table_name,
                 "stream": stream_id,
                 "schema": {
                     "type": "object",
@@ -437,8 +474,8 @@ def build_catalog_entries(
                         "metadata": {
                             "inclusion": "available",
                             "selected-by-default": False,
-                            "schema-name": schema,
-                            "database-name": database,
+                            "schema-name": schema_name,
+                            "database-name": database_name,
                             "table-key-properties": [],
                         },
                     },

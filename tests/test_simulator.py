@@ -238,7 +238,47 @@ def test_execute_dicts_zips_rows(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(sim.requests, "post", fake_post)
     rows = list(_client().execute_dicts("SELECT A, B FROM T"))
-    assert rows == [{"A": 1, "B": 2}, {"A": 3, "B": 4}]
+    # Keys are normalized, matching the property names discovery publishes.
+    assert rows == [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+
+
+def test_execute_dicts_keys_match_discovered_properties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Record keys and catalog properties must agree, or records fail validation."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {
+                    "rowType": [{"name": "EVENT_ID"}, {"name": "EVENT_TIMESTAMP"}],
+                },
+                "data": [["e1", "2026-01-01T00:00:00"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    row = next(iter(_client().execute_dicts("SELECT * FROM CUSTOMER_DB.PUBLIC.EVENTS")))
+    assert set(row) == {"event_id", "event_timestamp"}
+
+
+# ── identifier normalization ─────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("PUBLIC", "public"),
+        ("EVENT_ID", "event_id"),
+        ("already_lower", "already_lower"),
+        # Mixed case means the identifier was created quoted, so Snowflake
+        # preserves it and so must we — lower-casing it would break the lookup.
+        ("MixedCase", "MixedCase"),
+        ("", ""),
+    ],
+)
+def test_normalize_identifier(raw: str, expected: str) -> None:
+    assert sim.normalize_identifier(raw) == expected
 
 
 def test_execute_raises_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -338,16 +378,53 @@ def test_build_catalog_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     entries = sim.build_catalog_entries(_client(), database="CUSTOMER_DB")
 
     by_id = {e["tap_stream_id"]: e for e in entries}
-    # `{schema}-{table}` — no database prefix — matching what singer-sdk's
-    # SQLConnector.discover_catalog_entry emits on the driver path. Getting this
-    # wrong is silent: select rules and stream_maps simply stop matching.
-    assert set(by_id) == {"PUBLIC-CONTACTS", "PUBLIC-EVENTS"}
-    events = by_id["PUBLIC-EVENTS"]
-    assert events["schema"]["properties"]["EVENT_TIMESTAMP"]["format"] == "date-time"
-    assert events["table_name"] == "EVENTS"
+    # `{schema}-{table}` — no database prefix, case-normalized — matching what
+    # singer-sdk's SQLConnector.discover_catalog_entry emits on the driver path
+    # (snowflake-sqlalchemy lower-cases unquoted identifiers before the SDK sees
+    # them). Getting this wrong is silent: mk-airflow builds select rules and
+    # stream_maps as `{schema.lower()}-{table.lower()}`, so an upper-cased id
+    # matches nothing, every stream is deselected, and the pull writes zero rows
+    # while the DAG still reports success.
+    assert set(by_id) == {"public-contacts", "public-events"}
+    events = by_id["public-events"]
+    assert events["schema"]["properties"]["event_timestamp"]["format"] == "date-time"
+    assert events["table_name"] == "events"
     # The database is still carried in metadata even though it is not in the id.
     root = next(m for m in events["metadata"] if m["breadcrumb"] == [])
-    assert root["metadata"]["database-name"] == "CUSTOMER_DB"
+    assert root["metadata"]["database-name"] == "customer_db"
+    assert root["metadata"]["schema-name"] == "public"
+    # Column breadcrumbs must use the same normalized names as `properties`,
+    # or the SDK's selection logic cannot resolve them.
+    crumbs = {tuple(m["breadcrumb"]) for m in events["metadata"] if m["breadcrumb"]}
+    assert crumbs == {("properties", "event_id"), ("properties", "event_timestamp")}
+
+
+def test_build_catalog_entries_preserves_quoted_mixed_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed-case identifier was created quoted — normalizing it would break it."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {
+                    "rowType": [
+                        {"name": "TABLE_SCHEMA"},
+                        {"name": "TABLE_NAME"},
+                        {"name": "COLUMN_NAME"},
+                        {"name": "DATA_TYPE"},
+                    ],
+                },
+                "data": [["Analytics", "webEvents", "eventId", "TEXT"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    entries = sim.build_catalog_entries(_client(), database="CUSTOMER_DB")
+    assert [e["tap_stream_id"] for e in entries] == ["Analytics-webEvents"]
+    assert set(entries[0]["schema"]["properties"]) == {"eventId"}
 
 
 def test_build_catalog_entries_requires_database() -> None:
