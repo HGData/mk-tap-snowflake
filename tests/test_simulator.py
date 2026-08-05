@@ -1,0 +1,355 @@
+"""Unit tests for the DRAFT simulator (SQL API v2) mode — QA-291.
+
+Pure/offline: HTTP is monkeypatched, no simulator or Snowflake required.
+Covers config gating, response parsing (incl. partitions), record SQL shaping,
+and INFORMATION_SCHEMA-based discovery.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from tap_snowflake import simulator as sim
+
+
+class _FakeResponse:
+    def __init__(self, payload: Any, status: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status
+        self.ok = 200 <= status < 300
+        self.text = str(payload)
+
+    def json(self) -> Any:
+        return self._payload
+
+
+@pytest.fixture(autouse=True)
+def _neutral_deploy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `ENV` out of the picture unless a test sets it deliberately.
+
+    `load_simulator_config` refuses simulator mode when ENV is production, so an
+    inherited ENV in the runner's environment would otherwise flip these tests.
+    """
+    monkeypatch.delenv(sim.ENV_DEPLOY_ENV, raising=False)
+
+
+# ── config gating ────────────────────────────────────────────────────────────
+def test_config_disabled_when_no_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(sim.ENV_BASE_URL, raising=False)
+    assert sim.load_simulator_config({}) is None
+
+
+@pytest.mark.parametrize("env_value", ["prod", "PROD", " production "])
+def test_config_refused_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+) -> None:
+    """A stray override must not point a production pull at the simulator."""
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://snowflake-sim-01.example.com")
+    monkeypatch.setenv(sim.ENV_CLIENT_ID, "cid")
+    monkeypatch.setenv(sim.ENV_CLIENT_SECRET, "csecret")
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, env_value)
+    assert sim.load_simulator_config({}) is None
+
+
+def test_config_refused_in_production_even_via_explicit_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal is not env-var-only — explicit tap config cannot bypass it."""
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, "prod")
+    assert (
+        sim.load_simulator_config(
+            {
+                "simulator_base_url": "https://config-host",
+                "simulator_client_id": "c",
+                "simulator_client_secret": "s",
+            },
+        )
+        is None
+    )
+
+
+def test_config_enabled_in_non_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    """dev/local must still activate — the guard is narrow, not a kill switch."""
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://snowflake-sim-01.example.com")
+    monkeypatch.setenv(sim.ENV_CLIENT_ID, "cid")
+    monkeypatch.setenv(sim.ENV_CLIENT_SECRET, "csecret")
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, "dev")
+    assert sim.load_simulator_config({}) is not None
+
+
+def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://snowflake-sim-01.example.com/")
+    monkeypatch.setenv(sim.ENV_CLIENT_ID, "cid")
+    monkeypatch.setenv(sim.ENV_CLIENT_SECRET, "csecret")
+    cfg = sim.load_simulator_config({"database": "CUSTOMER_DB"})
+    assert cfg is not None
+    assert (
+        cfg.base_url == "https://snowflake-sim-01.example.com"
+    )  # trailing slash stripped
+    assert cfg.client_id == "cid"
+    assert cfg.database == "CUSTOMER_DB"
+
+
+def test_config_missing_creds_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://sim")
+    monkeypatch.delenv(sim.ENV_CLIENT_ID, raising=False)
+    monkeypatch.delenv(sim.ENV_CLIENT_ID_FALLBACK, raising=False)
+    with pytest.raises(ValueError, match="client id/secret"):
+        sim.load_simulator_config({})
+
+
+def test_config_prefers_explicit_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://env-host")
+    cfg = sim.load_simulator_config(
+        {
+            "simulator_base_url": "https://config-host",
+            "simulator_client_id": "c",
+            "simulator_client_secret": "s",
+        },
+    )
+    assert cfg is not None
+    assert cfg.base_url == "https://config-host"
+
+
+# ── type map ───────────────────────────────────────────────────────────────
+def test_type_map() -> None:
+    assert sim.snowflake_type_to_jsonschema("TIMESTAMP_NTZ")["format"] == "date-time"
+    assert "number" in sim.snowflake_type_to_jsonschema("NUMBER(38,0)")["type"]
+    # unknown types fall back to nullable string
+    assert sim.snowflake_type_to_jsonschema("GEOGRAPHY")["type"] == ["string", "null"]
+
+
+# ── statement execution + partitions ─────────────────────────────────────────
+def _client() -> sim.SnowflakeSimulatorClient:
+    return sim.SnowflakeSimulatorClient(
+        sim.SimulatorConfig(
+            base_url="https://sim",
+            client_id="c",
+            client_secret="s",
+            database="CUSTOMER_DB",
+        ),
+    )
+
+
+def test_execute_parses_columns_and_pages_partitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok", "expires_in": 600})
+        posts.append(kwargs.get("json", {}))
+        return _FakeResponse(
+            {
+                "statementHandle": "h1",
+                "resultSetMetaData": {
+                    "rowType": [{"name": "CONTACT_ID"}, {"name": "EMAIL"}],
+                    "partitionInfo": [{"rowCount": 1}, {"rowCount": 1}],
+                },
+                "data": [["c-1", "a@x.com"]],
+            },
+        )
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        assert kwargs["params"]["partition"] == 1
+        return _FakeResponse({"data": [["c-2", "b@x.com"]]})
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    monkeypatch.setattr(sim.requests, "get", fake_get)
+
+    cols, rows = _client().execute(
+        "SELECT CONTACT_ID, EMAIL FROM CUSTOMER_DB.PUBLIC.CONTACTS",
+    )
+    assert cols == ["CONTACT_ID", "EMAIL"]
+    assert rows == [["c-1", "a@x.com"], ["c-2", "b@x.com"]]  # inline + partition 1
+    assert posts[0]["database"] == "CUSTOMER_DB"
+
+
+def test_execute_raises_on_multi_partition_without_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-partition result with no handle must fail, not short-read.
+
+    Partition 0 is inline; 1..N need the statementHandle. Returning only
+    partition 0 would look like "the source has less data than expected"
+    instead of an error.
+    """
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                # no statementHandle, but three partitions advertised
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [
+                        {"rowCount": 1},
+                        {"rowCount": 1},
+                        {"rowCount": 1},
+                    ],
+                },
+                "data": [["only-partition-0"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    with pytest.raises(RuntimeError, match="no statementHandle to page them"):
+        _client().execute("SELECT A FROM CUSTOMER_DB.PUBLIC.EVENTS")
+
+
+def test_execute_single_partition_without_handle_is_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-partition result needs no handle — it is inline. Must not raise."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [{"rowCount": 1}],
+                },
+                "data": [["v"]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    cols, rows = _client().execute("SELECT A FROM CUSTOMER_DB.PUBLIC.EVENTS")
+    assert cols == ["A"]
+    assert rows == [["v"]]
+
+
+def test_execute_dicts_zips_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {"rowType": [{"name": "A"}, {"name": "B"}]},
+                "data": [[1, 2], [3, 4]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    rows = list(_client().execute_dicts("SELECT A, B FROM T"))
+    assert rows == [{"A": 1, "B": 2}, {"A": 3, "B": 4}]
+
+
+def test_execute_raises_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse({"message": "boom"}, status=422)
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    with pytest.raises(RuntimeError, match="Simulator statement failed"):
+        _client().execute("SELECT 1")
+
+
+# ── async lifecycle (202 RUNNING → poll → SUCCEEDED) ─────────────────────────
+def test_execute_polls_until_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 202 POST must be polled until SUCCEEDED, then results read (not 0 rows)."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        # Accepted but still executing — body carries no results.
+        return _FakeResponse({"statementHandle": "h9", "status": "RUNNING"}, status=202)
+
+    calls = {"n": 0}
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        assert url.endswith("/api/v2/statements/h9")
+        calls["n"] += 1
+        if calls["n"] < 3:  # RUNNING twice, then SUCCEEDED
+            return _FakeResponse({"status": "RUNNING"}, status=202)
+        return _FakeResponse(
+            {
+                "status": "SUCCEEDED",
+                "statementHandle": "h9",
+                "resultSetMetaData": {
+                    "rowType": [{"name": "A"}],
+                    "partitionInfo": [{"rowCount": 2}],
+                },
+                "data": [[1], [2]],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    monkeypatch.setattr(sim.requests, "get", fake_get)
+    monkeypatch.setattr(sim.time, "sleep", lambda _s: None)
+
+    cols, rows = _client().execute("SELECT A FROM T")
+    assert cols == ["A"]
+    assert rows == [[1], [2]]
+    assert calls["n"] == 3
+
+
+def test_execute_poll_terminal_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal status (e.g. 422 ABORTED/FAILED) during polling must raise."""
+
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse({"statementHandle": "h9", "status": "RUNNING"}, status=202)
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse({"message": "cancelled"}, status=422)
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    monkeypatch.setattr(sim.requests, "get", fake_get)
+    monkeypatch.setattr(sim.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="failed while polling"):
+        _client().execute("SELECT 1")
+
+
+# ── discovery ────────────────────────────────────────────────────────────────
+def test_build_catalog_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/oauth/token-request"):
+            return _FakeResponse({"access_token": "tok"})
+        return _FakeResponse(
+            {
+                "resultSetMetaData": {
+                    "rowType": [
+                        {"name": "TABLE_SCHEMA"},
+                        {"name": "TABLE_NAME"},
+                        {"name": "COLUMN_NAME"},
+                        {"name": "DATA_TYPE"},
+                    ],
+                },
+                "data": [
+                    ["PUBLIC", "CONTACTS", "CONTACT_ID", "TEXT"],
+                    ["PUBLIC", "CONTACTS", "EMAIL", "TEXT"],
+                    ["PUBLIC", "EVENTS", "EVENT_ID", "TEXT"],
+                    ["PUBLIC", "EVENTS", "EVENT_TIMESTAMP", "TIMESTAMP_NTZ"],
+                ],
+            },
+        )
+
+    monkeypatch.setattr(sim.requests, "post", fake_post)
+    entries = sim.build_catalog_entries(_client(), database="CUSTOMER_DB")
+
+    by_id = {e["tap_stream_id"]: e for e in entries}
+    # `{schema}-{table}` — no database prefix — matching what singer-sdk's
+    # SQLConnector.discover_catalog_entry emits on the driver path. Getting this
+    # wrong is silent: select rules and stream_maps simply stop matching.
+    assert set(by_id) == {"PUBLIC-CONTACTS", "PUBLIC-EVENTS"}
+    events = by_id["PUBLIC-EVENTS"]
+    assert events["schema"]["properties"]["EVENT_TIMESTAMP"]["format"] == "date-time"
+    assert events["table_name"] == "EVENTS"
+    # The database is still carried in metadata even though it is not in the id.
+    root = next(m for m in events["metadata"] if m["breadcrumb"] == [])
+    assert root["metadata"]["database-name"] == "CUSTOMER_DB"
+
+
+def test_build_catalog_entries_requires_database() -> None:
+    with pytest.raises(ValueError, match="requires `database`"):
+        sim.build_catalog_entries(_client(), database=None)
