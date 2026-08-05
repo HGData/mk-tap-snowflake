@@ -54,13 +54,20 @@ Files:
 - Or tap config: `simulator_base_url` / `simulator_client_id` / `simulator_client_secret`.
 - These reach the pull task via the `mdi_simulator_overrides` MWAA variable
   (QA-257 mechanism) — dev only; production never sets them.
+- **And that convention is enforced, not just documented:** `load_simulator_config`
+  refuses simulator mode outright when `ENV` is `prod`/`production`, whatever the
+  override injects, so a stray production override row cannot point a real pull at
+  fabricated data. It logs a warning and falls back to the driver path rather than
+  raising — a hard failure here would turn a safety guard into a production pull
+  outage. `ENV` is exported by `mk-data-ingestion-core`'s `dev`/`prod`/`local`
+  meltano environments and passed through by mk-airflow's pull task.
 
 ### Validated so far
 
-- `ruff check` + `ruff format` clean; **12** offline unit tests pass
+- `ruff check` + `ruff format` clean; **19** offline unit tests pass
   (`pytest tests/test_simulator.py`). No live sim or Snowflake required.
 - Verified on the `fix/preserve-bookmarks-incremental-sync` base (the ref MDI
-  pins): 12/12 pass against singer-sdk 0.52.4, and `pip install` of the branch
+  pins): 19/19 pass against singer-sdk 0.52.4, and `pip install` of the branch
   imports `tap_snowflake.client` with only declared dependencies present.
 - **Not** yet run end-to-end against the real simulator or through Meltano.
 

@@ -24,10 +24,59 @@ class _FakeResponse:
         return self._payload
 
 
+@pytest.fixture(autouse=True)
+def _neutral_deploy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `ENV` out of the picture unless a test sets it deliberately.
+
+    `load_simulator_config` refuses simulator mode when ENV is production, so an
+    inherited ENV in the runner's environment would otherwise flip these tests.
+    """
+    monkeypatch.delenv(sim.ENV_DEPLOY_ENV, raising=False)
+
+
 # ── config gating ────────────────────────────────────────────────────────────
 def test_config_disabled_when_no_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(sim.ENV_BASE_URL, raising=False)
     assert sim.load_simulator_config({}) is None
+
+
+@pytest.mark.parametrize("env_value", ["prod", "PROD", " production "])
+def test_config_refused_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+) -> None:
+    """A stray override must not point a production pull at the simulator."""
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://snowflake-sim-01.example.com")
+    monkeypatch.setenv(sim.ENV_CLIENT_ID, "cid")
+    monkeypatch.setenv(sim.ENV_CLIENT_SECRET, "csecret")
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, env_value)
+    assert sim.load_simulator_config({}) is None
+
+
+def test_config_refused_in_production_even_via_explicit_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal is not env-var-only — explicit tap config cannot bypass it."""
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, "prod")
+    assert (
+        sim.load_simulator_config(
+            {
+                "simulator_base_url": "https://config-host",
+                "simulator_client_id": "c",
+                "simulator_client_secret": "s",
+            },
+        )
+        is None
+    )
+
+
+def test_config_enabled_in_non_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    """dev/local must still activate — the guard is narrow, not a kill switch."""
+    monkeypatch.setenv(sim.ENV_BASE_URL, "https://snowflake-sim-01.example.com")
+    monkeypatch.setenv(sim.ENV_CLIENT_ID, "cid")
+    monkeypatch.setenv(sim.ENV_CLIENT_SECRET, "csecret")
+    monkeypatch.setenv(sim.ENV_DEPLOY_ENV, "dev")
+    assert sim.load_simulator_config({}) is not None
 
 
 def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

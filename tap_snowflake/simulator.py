@@ -19,12 +19,17 @@ module is a no-op and the tap behaves exactly as today (driver path). The
 `mdi_simulator_overrides` MWAA variable injects these env vars onto the pull
 task's ECS container in dev only; production never sets them.
 
+That last sentence is a convention, so it is backed by a second, structural
+gate: simulator mode is refused outright when `ENV` says we are in production,
+whatever the override injects. See `load_simulator_config`.
+
 See docs/simulator-rest-mode.md for the design and open questions.
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -47,9 +52,19 @@ ENV_CLIENT_SECRET = "SIMULATOR_TAP_SNOWFLAKE_CLIENT_SECRET"  # noqa: S105 — en
 ENV_CLIENT_ID_FALLBACK = "TAP_SNOWFLAKE_CLIENT_ID"
 ENV_CLIENT_SECRET_FALLBACK = "TAP_SNOWFLAKE_CLIENT_SECRET"  # noqa: S105 — env var name, not a secret
 
+# Deployment environment. `mk-data-ingestion-core`'s meltano.yml defines the
+# `dev`/`prod`/`local` environments, each exporting `ENV`, and mk-airflow's
+# pull task passes it through (`- name: "ENV" value: "{{ env }}"`). We treat it
+# as a hard refusal rather than a hint: a stray override row must never be able
+# to point a production pull at fabricated data.
+ENV_DEPLOY_ENV = "ENV"
+_PROD_ENV_VALUES = frozenset({"prod", "production"})
+
 _HTTP_TIMEOUT_S = 60
 _STATEMENT_TIMEOUT_S = 300
 _POLL_INTERVAL_S = 1.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -78,6 +93,12 @@ def load_simulator_config(config: dict[str, Any] | None) -> SimulatorConfig | No
     Precedence: explicit tap config (`simulator_*`) first, then env. Returns None
     when no base URL is set anywhere — that is the fail-closed "run against real
     Snowflake as usual" path.
+
+    Returns None *even when a base URL is set* if `ENV` says production. Simulator
+    mode is dev/test-only, and a misconfigured override in production would
+    otherwise succeed quietly against fabricated data rather than failing — so we
+    log loudly and fall back to the real connection instead of raising, which
+    would turn this guard into a production pull failure.
     """
     config = config or {}
 
@@ -86,6 +107,18 @@ def load_simulator_config(config: dict[str, Any] | None) -> SimulatorConfig | No
         os.environ.get(ENV_BASE_URL),
     )
     if not base_url:
+        return None
+
+    deploy_env = (os.environ.get(ENV_DEPLOY_ENV) or "").strip().lower()
+    if deploy_env in _PROD_ENV_VALUES:
+        logger.warning(
+            "%s is set but %s=%s — refusing simulator mode and using the real "
+            "Snowflake connection. Simulator mode is dev/test-only; check "
+            "mdi_simulator_overrides for a stray production entry.",
+            ENV_BASE_URL,
+            ENV_DEPLOY_ENV,
+            deploy_env,
+        )
         return None
 
     client_id = _first(
