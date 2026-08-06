@@ -6,7 +6,6 @@ This includes SnowflakeStream and SnowflakeConnector.
 from __future__ import annotations
 
 import contextlib
-import datetime
 import sys
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -15,46 +14,34 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-import singer_sdk.helpers._typing
 import sqlalchemy
+import sqlalchemy.engine
+import sqlalchemy.engine.reflection
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
-from singer_sdk import SQLConnector, SQLStream, metrics
+from singer_sdk import metrics
 from singer_sdk.exceptions import ConfigValidationError
+from singer_sdk.sql import SQLConnector, SQLStream
+from singer_sdk.sql.connector import SQLToJSONSchema
 from singer_sdk.streams.core import REPLICATION_FULL_TABLE, REPLICATION_INCREMENTAL
 from snowflake.sqlalchemy import URL
 from sqlalchemy.sql import text
 
+from tap_snowflake.simulator import (
+    SnowflakeSimulatorClient,
+    build_catalog_entries,
+    load_simulator_config,
+)
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from singer_sdk.helpers import types
     from singer_sdk.helpers._batch import BaseBatchFileEncoding, BatchConfig
+    from singer_sdk.sql.connector import FullyQualifiedName
     from sqlalchemy.engine import Connection, CursorResult
     from sqlalchemy.sql import Executable
     from sqlalchemy.sql.elements import TextClause
-
-unpatched_conform = singer_sdk.helpers._typing._conform_primitive_property
-
-
-def patched_conform(
-    elem: Any,
-    property_schema: dict,
-) -> Any:
-    """Overrides Singer SDK type conformance to prevent dates turning into datetimes.
-
-    Converts a primitive (i.e. not object or array) to a json compatible type.
-
-    Returns:
-        The appropriate json compatible type.
-    """
-    if isinstance(elem, datetime.date):
-        return elem.isoformat()
-
-    return unpatched_conform(elem=elem, property_schema=property_schema)
-
-
-singer_sdk.helpers._typing._conform_primitive_property = patched_conform
 
 
 class SnowflakeAuthMethod(Enum):
@@ -95,8 +82,38 @@ class TableProfile:
     size_in_mb: int | None
 
 
+class SnowflakeToJSONSchema(SQLToJSONSchema):
+    """Snowflake to JSON schema.
+
+    We can't take advantage of this instance to map the type of VARIANT, ARRAY, and
+    OBJECT columns because snowflake-sqlalchemy returns JSON strings:
+
+    https://github.com/snowflakedb/snowflake-sqlalchemy/blob/31062877ae013e0fda3194142055b9aea58acdfc/README.md#variant-array-and-object-support
+    """
+
+
 class SnowflakeConnector(SQLConnector):
     """Connects to the Snowflake SQL source."""
+
+    sql_to_jsonschema_converter = SnowflakeToJSONSchema
+
+    @cached_property
+    def simulator_client(self) -> SnowflakeSimulatorClient | None:
+        """A SQL API v2 client when simulator mode is enabled, else None.
+
+        DRAFT (QA-291). Fail-closed: returns None unless a simulator base URL is
+        configured (env `SIMULATOR_TAP_SNOWFLAKE_BASE_URL` or `simulator_base_url`
+        config), in which case the driver path is bypassed for discovery + reads.
+        """
+        config = load_simulator_config(dict(self.config))
+        if config is None:
+            return None
+        self.logger.info(
+            "tap-snowflake: SIMULATOR MODE enabled — reading from SQL API v2 sim at %s "
+            "(driver path bypassed). This must never be set in production.",
+            config.base_url,
+        )
+        return SnowflakeSimulatorClient(config)
 
     def get_private_key(self) -> bytes:
         """Get private key from the right location."""
@@ -207,42 +224,82 @@ class SnowflakeConnector(SQLConnector):
         return engine
 
     # overridden to filter out the information_schema from catalog discovery
-    def discover_catalog_entries(self) -> list[dict]:
+    def discover_catalog_entries(
+        self,
+        *,
+        exclude_schemas: Sequence[str] = (),
+        reflect_indices: bool = True,
+    ) -> list[dict]:
         """Return a list of catalog entries from discovery.
+
+        Args:
+            exclude_schemas: A list of schema names to exclude from discovery.
+            reflect_indices: Whether to reflect indices to detect potential primary
+                keys.
 
         Returns:
             The discovered catalog entries as a list.
         """
+        if self.simulator_client is not None:
+            # Simulator mode: reflect over the SQL API v2 instead of the driver.
+            return build_catalog_entries(
+                self.simulator_client,
+                self.config.get("database"),
+                self.config.get("tables"),
+            )
+
         result: list[dict] = []
         tables = [t.lower() for t in self.config.get("tables", [])]
         engine = self.create_engine()
         inspected = sqlalchemy.inspect(engine)
-        schema_names = [
-            self._dialect.identifier_preparer.quote(schema_name)
-            for schema_name in self.get_schema_names(engine, inspected)
-            if schema_name.lower() != "information_schema"
-        ]
-        not_tables = not tables
-        table_schemas = {} if not_tables else {x.split(".")[0] for x in tables}
-        table_schema_names = [
-            x for x in schema_names if x in table_schemas
-        ] or schema_names
+        table_schema_names: list[str] = list(
+            ()  # No tables specified
+            if not tables
+            else {x.split(".")[0] for x in tables}  # Get the schema from each table
+        )
+        if not table_schema_names:
+            table_schema_names = [
+                self._dialect.identifier_preparer.quote(schema_name)
+                for schema_name in self.get_schema_names(engine, inspected)
+                if schema_name.lower() != "information_schema"
+            ]
+
+        object_kinds = (
+            (sqlalchemy.engine.reflection.ObjectKind.TABLE, False),
+            (sqlalchemy.engine.reflection.ObjectKind.ANY_VIEW, True),
+        )
         for schema_name in table_schema_names:
             # Iterate through each table and view of relevant schemas
-            for table_name, is_view in self.get_object_names(
-                engine,
-                inspected,
-                schema_name,
-            ):
-                if not_tables or (f"{schema_name}.{table_name}" in tables):
-                    catalog_entry = self.discover_catalog_entry(
+            if schema_name in exclude_schemas:
+                continue
+
+            primary_keys = inspected.get_multi_pk_constraint(schema=schema_name)
+
+            if reflect_indices:
+                indices = inspected.get_multi_indexes(schema=schema_name)
+            else:
+                indices = {}
+
+            for object_kind, is_view in object_kinds:
+                columns = inspected.get_multi_columns(
+                    schema=schema_name,
+                    kind=object_kind,
+                )
+
+                result.extend(
+                    self.discover_catalog_entry(
                         engine,
                         inspected,
                         schema_name,
-                        table_name,
+                        table,
                         is_view,
-                    )
-                    result.append(catalog_entry.to_dict())
+                        reflected_columns=columns[schema, table],
+                        reflected_pk=primary_keys.get((schema, table)),
+                        reflected_indices=indices.get((schema, table), []),
+                    ).to_dict()
+                    for schema, table in columns
+                    if not tables or (f"{schema_name}.{table}" in tables)
+                )
 
         return result
 
@@ -251,6 +308,7 @@ class SnowflakeConnector(SQLConnector):
         full_table_name: str,
         stats: set[ProfileStats],
         profile_columns: list[str] | None = None,
+        where_clause: str | None = None,
     ) -> TableProfile:
         """Scan source system for a set of profile stats.
 
@@ -273,6 +331,12 @@ class SnowflakeConnector(SQLConnector):
         Note: Gathering stats can take a long time. The implementation should attempt
         to combine stats gathering into fewer tables scans where possible and only
         spend time pulling in requested stats.
+
+        Args:
+            full_table_name: Fully qualified table name.
+            stats: Set of profile statistics to collect.
+            profile_columns: List of column names to profile.
+            where_clause: Optional WHERE clause to filter the table (e.g., "col >= value").
 
         Returns:
             A TableProfile object. Stats may be left null if not requested, not
@@ -302,9 +366,14 @@ class SnowflakeConnector(SQLConnector):
                 expressions.append(f"count({col}) as nonnull__{col}")
             if ProfileStats.COLUMN_NULL_VALUES in stats:
                 expressions.append(f"count(1) - count({col}) as null__{col}")
+        
+        query = f"SELECT {', '.join(expressions)} FROM {full_table_name}"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+
         result_dict = (
             self.execute(
-                text(f"SELECT {', '.join(expressions)} FROM {full_table_name}"),
+                text(query),
             )
             .one()
             ._asdict()
@@ -349,39 +418,84 @@ class SnowflakeStream(SQLStream):
         This is a proposed replacement for the SDK internal SQLStream._sync_baches.
         Per: https://github.com/meltano/sdk/issues/976
 
-        This version stores the max replication value before batch sync starts, and then
-        increments the stream state with this value after the sync operation completes.
-
-        Since any FULL_TABLE sync operations may subsequently be run as INCREMENTAL,
-        the querying of the max value is not dependent upon running in INCREMENTAL mode.
+        This version preserves existing bookmarks, collects the max replication value
+        only from records that were actually synced (filtered by bookmark if it exists),
+        and increments the stream state with this value after the sync operation completes.
 
         Args:
             batch_config: The batch configuration.
             context: Stream partition or context dictionary.
         """
+        # Capture existing bookmark BEFORE _write_starting_replication_value
+        # Read directly from state like the SDK does, to avoid dependency on
+        # STARTING_MARKER which is only set after _write_starting_replication_value
+        # This ensures we preserve the bookmark even if
+        # _write_starting_replication_value tries to reset it
+        existing_bookmark = None
+        if self.replication_key:
+            state = self.get_context_state(context)
+            replication_key_value = state.get("replication_key_value")
+            if replication_key_value and self.replication_key == state.get(
+                "replication_key",
+            ):
+                # Keep the bookmark as-is from state
+                # (already JSON-compatible string/number)
+                existing_bookmark = replication_key_value
+
         self._write_starting_replication_value(context)
 
-        # New: Collect the max value for the replication column.
+        # Collect the max value for the replication column.
+        # If bookmark exists, only collect max from records >= bookmark
+        # (incremental sync). If no bookmark, collect max from entire table
+        # (first sync / full table).
         max_replication_key_value = None
         if self.replication_key:
-            table_profile: TableProfile = self.connector.get_table_profile(  # type: ignore[attr-defined]
-                full_table_name=self.fully_qualified_name,
-                stats={ProfileStats.COLUMN_MAX_VALUE},
-                profile_columns=[self.replication_key],
-            )
+            if existing_bookmark:
+                # Incremental sync: only get max from records that will be synced
+                # Format the bookmark value for SQL WHERE clause.
+                # State stores values as JSON-compatible strings, so we need to
+                # format them properly for SQL (handle strings, timestamps, numbers)
+                if self.is_timestamp_replication_key:
+                    # For timestamps, wrap in quotes (already a string from state)
+                    bookmark_str = f"'{existing_bookmark}'"
+                elif isinstance(existing_bookmark, str):
+                    # For string values, escape single quotes and wrap in quotes
+                    escaped = existing_bookmark.replace(chr(39), chr(39) + chr(39))
+                    bookmark_str = f"'{escaped}'"
+                else:
+                    # For numeric values, use as-is
+                    bookmark_str = str(existing_bookmark)
+
+                where_clause = f"{self.replication_key} >= {bookmark_str}"
+                table_profile: TableProfile = (
+                    self.connector.get_table_profile(  # type: ignore[attr-defined]
+                        full_table_name=self.fully_qualified_name,
+                        stats={ProfileStats.COLUMN_MAX_VALUE},
+                        profile_columns=[self.replication_key],
+                        where_clause=where_clause,
+                    )
+                )
+            else:
+                # First sync or full table: get max from entire table
+                table_profile = self.connector.get_table_profile(  # type: ignore[attr-defined]
+                    full_table_name=self.fully_qualified_name,
+                    stats={ProfileStats.COLUMN_MAX_VALUE},
+                    profile_columns=[self.replication_key],
+                )
+
             max_replication_key_value = table_profile.column_profiles[
                 self.replication_key
             ].max_value
 
-        # Not chanded: Note that the STATE messages will not have an incremented
-        # replication key value at this point.
+        # Sync batches
         with metrics.batch_counter(self.name, context=context) as counter:
             for encoding, manifest in self.get_batches(batch_config, context):
                 counter.increment()
                 self._write_batch_message(encoding=encoding, manifest=manifest)
                 self._write_state_message()
 
-        # New: Increment and emit the final STATE message after sync has completed.
+        # Increment and emit the final STATE message after sync has completed.
+        # Only update state if we have a max value (records were synced).
         if max_replication_key_value:
             self._increment_stream_state(
                 latest_record={
@@ -416,7 +530,7 @@ class SnowflakeStream(SQLStream):
         sync_id: str,
         prefix: str,
         objects: list[str],
-        table_name: str,
+        table_name: FullyQualifiedName,
     ) -> tuple[TextClause, dict]:
         """Get FULL_TABLE copy statement and key bindings."""
         statement = [f"copy into '@~/tap-snowflake/{sync_id}/{prefix}' from "]
@@ -442,7 +556,7 @@ class SnowflakeStream(SQLStream):
         sync_id: str,
         prefix: str,
         objects: list[str],
-        table_name: str,
+        table_name: FullyQualifiedName,
         replication_key_value,
     ) -> tuple[TextClause, dict]:
         """Get INCREMENTAL copy statement and key bindings."""
@@ -551,6 +665,53 @@ class SnowflakeStream(SQLStream):
 
     # Get records from stream
     # Overridden to use native objects under `if start_val:`
+    def _get_records_via_simulator(
+        self,
+        context: types.Context | None,
+    ) -> Iterable[dict[str, Any]]:
+        r"""DRAFT (QA-291): read records over the SQL API v2 simulator.
+
+        Builds the same SELECT the SQLAlchemy record path would (selected
+        columns, incremental replication-key filter + ordering) and runs it
+        over REST. Record mode only — the internal-stage batch path
+        (`get_batches_from_internal_user_stage`) is not simulatable over SQL
+        API v2 and must stay disabled (no `batch_config`) in simulator runs.
+
+        LIMITATION (QA-291 follow-up (e)): identifiers are interpolated
+        UNQUOTED. `simulator.normalize_identifier` faithfully preserves an
+        identifier that needs quoting (`eventId`, `HAS-DASH`, a reserved word),
+        but this SELECT would then emit it bare and Snowflake would resolve it
+        to the upper-cased form — the wrong column. Unreachable today: the
+        simulator serves only `CUSTOMER_DB.PUBLIC.{CONTACTS,EVENTS}` with legal
+        upper-case identifiers, so nothing quote-requiring can arrive. Fixing it
+        properly means denormalizing and running each component through the
+        dialect's identifier preparer here, AND widening the simulator's query
+        router, whose `\bfrom\b\s+([\w.]+)` regex does not match quoted names —
+        so quoting unilaterally would misroute reads. Two repos, tracked
+        separately rather than done as a drive-by.
+        """
+        client = self.connector.simulator_client  # type: ignore[attr-defined]
+        assert client is not None  # noqa: S101 — guarded by caller
+
+        selected = list(self.get_selected_schema()["properties"].keys())
+        col_list = ", ".join(selected) if selected else "*"
+        sql = f"SELECT {col_list} FROM {self.fully_qualified_name}"
+
+        clause = ""
+        if self.replication_key:
+            start_val = self.get_starting_replication_key_value(context)
+            if start_val is not None:
+                # DRAFT: inline literal (escaped). Switch to SQL API v2 bindings
+                # once the sim's binding support is confirmed. See docs.
+                literal = str(start_val).replace("'", "''")
+                clause += f" WHERE {self.replication_key} >= '{literal}'"
+            clause += f" ORDER BY {self.replication_key}"
+
+        if self.ABORT_AT_RECORD_COUNT is not None:
+            clause += f" LIMIT {self.ABORT_AT_RECORD_COUNT}"
+
+        yield from client.execute_dicts(f"{sql}{clause}")
+
     def get_records(self, context: types.Context | None) -> Iterable[dict[str, Any]]:
         """Return a generator of record-type dictionary objects.
 
@@ -572,6 +733,10 @@ class SnowflakeStream(SQLStream):
         if context:
             msg = f"Stream '{self.name}' does not support partitioning."
             raise NotImplementedError(msg)
+
+        if self.connector.simulator_client is not None:  # type: ignore[attr-defined]
+            yield from self._get_records_via_simulator(context)
+            return
 
         selected_column_names = self.get_selected_schema()["properties"].keys()
         table = self.connector.get_table(

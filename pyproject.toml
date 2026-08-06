@@ -15,18 +15,23 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.9"
+python = ">=3.10"
 cryptography = ">=40"
-singer-sdk = "~=0.39.1"
-snowflake-sqlalchemy = "1.6.1"
-snowflake-connector-python = { version = "~=3.15.0", extras = ["secure-local-storage"] }
-sqlalchemy = "~=2.0.34"
+singer-sdk = "~=0.52.4"
+snowflake-sqlalchemy = "1.7.7"
+snowflake-connector-python = { version = "~=3.17.4", extras = ["secure-local-storage"] }
+sqlalchemy = "~=2.0.43"
+# Used by the dev-only simulator (SQL API v2) mode in tap_snowflake/simulator.py.
+# Was only present transitively (via snowflake-connector-python); declared here as
+# a direct dependency because client.py imports simulator.py at module scope, so
+# the driver path needs it importable too. Locked in the main group at 2.32.5.
+requests = ">=2.31,<3"
 
 [tool.poetry.group.dev.dependencies]
-mypy = ">=1"
+mypy = ">=1.17"
 singer-sdk = {extras = ["testing"], version = "*"}
-tox = "^3.24.4"
-ruff = "^0.6.7"
+tox = "~=4.30.2"
+ruff = "~=0.14.0"
 
 [tool.isort]
 profile = "black"
@@ -36,12 +41,13 @@ src_paths = "tap_snowflake"
 [tool.ruff]
 line-length = 88
 src = ["target_snowflake"]
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 ignore = [
     "ANN001",
     "ANN401",
+    "COM812",
     "S608",
     "SLF001",
     "EM101",
@@ -51,6 +57,13 @@ select = ["ALL"]
 [tool.ruff.format]
 quote-style = "double"
 exclude = ["*.pyi"]
+
+[tool.ruff.lint.per-file-ignores]
+# Hand-written pytest modules under `select = ["ALL"]`: allow asserts, test
+# credentials, magic-value comparisons, fixture-signature args, and relax
+# docstring requirements. (Added for QA-291 — the existing suite used the SDK's
+# generated test class, which sidesteps these; unit tests need the exemption.)
+"tests/**" = ["S101", "S105", "S106", "D100", "D101", "D103", "ARG001", "PLR2004"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["target_snowflake"]
@@ -62,7 +75,7 @@ convention = "google"
 max-complexity = 10
 
 [build-system]
-requires = ["poetry-core==2.1.2", "poetry-dynamic-versioning==1.8.2"]
+requires = ["poetry-core==2.2.1", "poetry-dynamic-versioning==1.9.1"]
 build-backend = "poetry_dynamic_versioning.backend"
 
 [tool.poetry.scripts]
