@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum, auto
 from functools import cached_property
 from pathlib import Path
@@ -21,6 +22,10 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from singer_sdk import metrics
 from singer_sdk.exceptions import ConfigValidationError
+from singer_sdk.helpers._state import (
+    get_starting_replication_value,
+    write_starting_replication_value,
+)
 from singer_sdk.sql import SQLConnector, SQLStream
 from singer_sdk.sql.connector import SQLToJSONSchema
 from singer_sdk.streams.core import REPLICATION_FULL_TABLE, REPLICATION_INCREMENTAL
@@ -403,10 +408,124 @@ class SnowflakeStream(SQLStream):
 
     connector_class = SnowflakeConnector
 
+    # Partition contexts discovered for this run; see `partitions`.
+    _discovered_partitions: list[dict] | None = None
+
     @property
     def is_sorted(self) -> bool:
         """Is sorted."""
         return bool(self.replication_key)
+
+    @cached_property
+    def partition_column(self) -> str | None:
+        """The column whose values each keep their own bookmark, or None.
+
+        Set through the `partition_columns` setting, keyed by stream name. One
+        table that holds several kinds of row, such as an event table with an
+        event-name column, can carry rows of one kind that land long after rows of
+        another kind with later replication keys. A single bookmark for the table
+        then skips the late kind; one bookmark per value of this column does not.
+        """
+        configured = (self.config.get("partition_columns") or {}).get(self.name)
+        if not configured:
+            return None
+        if not self.replication_key:
+            self.logger.warning(
+                "Stream '%s' has no replication key; partition_columns is ignored",
+                self.name,
+            )
+            return None
+        selected = {
+            name.lower(): name
+            for name in self.get_selected_schema().get("properties", {})
+        }
+        column = selected.get(str(configured).lower())
+        if column is None:
+            msg = (
+                f"partition_columns names '{configured}' for stream '{self.name}', "
+                "which is not one of its selected columns"
+            )
+            raise ConfigValidationError(msg)
+        return column
+
+    @property
+    def partitions(self) -> list[dict] | None:
+        """One partition per distinct value of `partition_column`, when it is set.
+
+        The values are read from the table at the start of every run, so a kind of
+        row that appears for the first time is picked up by the run after it lands.
+        Without `partition_column` the SDK default applies.
+        """
+        if self.partition_column is None:
+            return super().partitions
+        if self._discovered_partitions is None:
+            values = self._distinct_partition_values()
+            self._discovered_partitions = [
+                {self.partition_column: value} for value in values
+            ]
+            self.logger.info(
+                "Stream '%s' keeps one bookmark per %s: %d values",
+                self.name,
+                self.partition_column,
+                len(values),
+            )
+        return self._discovered_partitions or None
+
+    def _distinct_partition_values(self) -> list[Any]:
+        """Return the distinct values of `partition_column`, NULL last."""
+        table = self.connector.get_table(
+            full_table_name=self.fully_qualified_name,
+            column_names=[self.partition_column],
+        )
+        column = table.columns[self.partition_column]
+        query = sqlalchemy.select(column).distinct()
+        values = [row[0] for row in self.connector.execute(query)]  # type: ignore[attr-defined]
+        return sorted(values, key=lambda value: (value is None, str(value)))
+
+    def _write_starting_replication_value(self, context: types.Context | None) -> None:
+        """Start a partition with no bookmark of its own from the table's bookmark.
+
+        A table that ran with one bookmark before `partition_columns` was set has
+        that bookmark in its stream state. Each partition starts from it the first
+        time it runs, so turning partitioning on re-reads nothing. The stream-level
+        value is not advanced afterwards, so a kind of row that first appears later
+        starts from the same point. A table with no earlier bookmark reads each
+        partition from the beginning, as an unpartitioned first run does.
+        """
+        super()._write_starting_replication_value(context)
+        if not (self.partition_column and context):
+            return
+        partition_state = self.get_context_state(context)
+        if get_starting_replication_value(partition_state) is not None:
+            return
+        stream_state = self.stream_state
+        table_bookmark = stream_state.get("replication_key_value")
+        same_key = stream_state.get("replication_key") == self.replication_key
+        if table_bookmark and same_key:
+            write_starting_replication_value(partition_state, table_bookmark)
+            self.logger.info(
+                "Partition %s of stream '%s' starts from the table bookmark %s",
+                context,
+                self.name,
+                table_bookmark,
+            )
+
+    def _replication_key_upper_bound(self, context: types.Context | None) -> str | None:
+        """The latest replication key value this run may read, or None for no limit.
+
+        Set through `max_future_bookmark_seconds`: rows stamped later than the sync
+        start plus that many seconds are left for a later run. One row stamped in the
+        future would otherwise carry the bookmark past every row written before that
+        time. The bound is rendered in the same ISO form as the stored bookmark, so
+        the warehouse compares it the way it compares the bookmark.
+        """
+        seconds = self.config.get("max_future_bookmark_seconds")
+        if seconds is None or not self.is_timestamp_replication_key:
+            return None
+        signpost = self.get_replication_key_signpost(context)
+        if signpost is None:
+            return None
+        return (signpost + timedelta(seconds=int(seconds))).isoformat()
 
     def _sync_batches(
         self,
@@ -425,7 +544,17 @@ class SnowflakeStream(SQLStream):
         Args:
             batch_config: The batch configuration.
             context: Stream partition or context dictionary.
+
+        Raises:
+            NotImplementedError: If the stream is partitioned, which batch mode does
+                not support.
         """
+        if self.partition_column:
+            msg = (
+                f"Stream '{self.name}' sets partition_columns, which needs record "
+                "mode; leave batch_config unset"
+            )
+            raise NotImplementedError(msg)
         # Capture existing bookmark BEFORE _write_starting_replication_value
         # Read directly from state like the SDK does, to avoid dependency on
         # STARTING_MARKER which is only set after _write_starting_replication_value
@@ -697,14 +826,24 @@ class SnowflakeStream(SQLStream):
         col_list = ", ".join(selected) if selected else "*"
         sql = f"SELECT {col_list} FROM {self.fully_qualified_name}"
 
+        if self.partition_column:
+            msg = "partition_columns is not supported in simulator mode"
+            raise NotImplementedError(msg)
+
         clause = ""
         if self.replication_key:
+            conditions = []
             start_val = self.get_starting_replication_key_value(context)
             if start_val is not None:
                 # DRAFT: inline literal (escaped). Switch to SQL API v2 bindings
                 # once the sim's binding support is confirmed. See docs.
                 literal = str(start_val).replace("'", "''")
-                clause += f" WHERE {self.replication_key} >= '{literal}'"
+                conditions.append(f"{self.replication_key} >= '{literal}'")
+            upper_bound = self._replication_key_upper_bound(context)
+            if upper_bound is not None:
+                conditions.append(f"{self.replication_key} <= '{upper_bound}'")
+            if conditions:
+                clause += " WHERE " + " AND ".join(conditions)
             clause += f" ORDER BY {self.replication_key}"
 
         if self.ABORT_AT_RECORD_COUNT is not None:
@@ -718,10 +857,13 @@ class SnowflakeStream(SQLStream):
         If the stream has a replication_key value defined, records will be sorted by the
         incremental key. If the stream also has an available starting bookmark, the
         records will be filtered for values greater than or equal to the bookmark value.
+        With `max_future_bookmark_seconds` set, records stamped later than the sync
+        start plus that margin are left for a later run.
 
         Args:
-            context: If partition context is provided, will read specifically from this
-                data slice.
+            context: The partition to read, when the stream sets `partition_columns`:
+                only rows holding that partition's value are read, from that
+                partition's own bookmark.
 
         Yields:
             One dict per record.
@@ -730,7 +872,7 @@ class SnowflakeStream(SQLStream):
             NotImplementedError: If partition is passed in context and the stream does
                 not support partitioning.
         """
-        if context:
+        if context and not self.partition_column:
             msg = f"Stream '{self.name}' does not support partitioning."
             raise NotImplementedError(msg)
 
@@ -745,6 +887,13 @@ class SnowflakeStream(SQLStream):
         )
         query = table.select()
 
+        if self.partition_column and context:
+            partition_col = table.columns[self.partition_column]
+            value = context[self.partition_column]
+            query = query.where(
+                partition_col.is_(None) if value is None else partition_col == value,
+            )
+
         if self.replication_key:
             replication_key_col = table.columns[self.replication_key]
             query = query.order_by(replication_key_col)
@@ -752,6 +901,10 @@ class SnowflakeStream(SQLStream):
             start_val = self.get_starting_replication_key_value(context)
             if start_val:
                 query = query.where(replication_key_col >= start_val)
+
+            upper_bound = self._replication_key_upper_bound(context)
+            if upper_bound is not None:
+                query = query.where(replication_key_col <= upper_bound)
 
         if self.ABORT_AT_RECORD_COUNT is not None:
             query = query.limit(self.ABORT_AT_RECORD_COUNT)

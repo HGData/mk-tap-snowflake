@@ -110,6 +110,32 @@ class TapSnowflake(SQLTap):
                 "configuration parameter."
             ),
         ),
+        th.Property(
+            "partition_columns",
+            th.ObjectType(additional_properties=th.StringType),
+            required=False,
+            description=(
+                "Stream name to the column whose values each keep their own "
+                'bookmark, for example {"public-events": "event_name"}. Use it for '
+                "a table that holds several kinds of row loaded at different "
+                "times, where one bookmark for the whole table would skip rows of "
+                "the kind that lands later. Each partition starts from the table's "
+                "existing bookmark, so turning it on re-reads nothing. Record mode "
+                "only. Streams not named keep one bookmark."
+            ),
+        ),
+        th.Property(
+            "max_future_bookmark_seconds",
+            th.IntegerType,
+            required=False,
+            description=(
+                "Read only rows whose timestamp replication key is at most this "
+                "many seconds after the sync started; later rows are read by a "
+                "later run. Stops one row stamped in the future from carrying the "
+                "bookmark past rows written before that time. Unset reads every "
+                "row at or after the bookmark."
+            ),
+        ),
         # ── Simulator mode (DRAFT — QA-291) ──────────────────────────────────
         # Dev/test-only. When `simulator_base_url` is set (or the
         # SIMULATOR_TAP_SNOWFLAKE_BASE_URL env var), discovery + record reads go
