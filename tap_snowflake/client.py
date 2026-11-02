@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from functools import cached_property
 from pathlib import Path
@@ -47,6 +48,16 @@ if TYPE_CHECKING:
 # Stream-state key for the value a finished read ended on and how many rows carried
 # it, so the next run can tell whether that value has gained rows since.
 BOOKMARK_ROWS = "bookmark_rows"
+
+
+def _has_fraction_of_a_second(value: object) -> bool:
+    """Return whether a bookmark is a timestamp finer than whole seconds."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).microsecond != 0
+    except ValueError:
+        return False
 
 
 class SnowflakeAuthMethod(Enum):
@@ -730,7 +741,12 @@ class SnowflakeStream(SQLStream):
         strictly after it, so a load written under one shared value is read once
         instead of on every run until a newer load lands. A run that stopped
         part-way, a bookmark edited by hand, or rows added at the value since (a load
-        committed in pieces, a date-only stamp) read at or after the bookmark.
+        committed in pieces) read at or after the bookmark.
+
+        Only a timestamp with a fraction of a second qualifies. A date-only or
+        whole-second stamp is shared by rows written at different times, and a row
+        changed in place at that same value leaves the count unchanged, so those
+        bookmarks keep reading at or after.
 
         Args:
             table: The table being read.
@@ -742,6 +758,8 @@ class SnowflakeStream(SQLStream):
         """
         recorded = self.get_context_state(context).get(BOOKMARK_ROWS)
         if not recorded or recorded.get("replication_key_value") != start_val:
+            return False
+        if not _has_fraction_of_a_second(start_val):
             return False
 
         replication_key_col = table.columns[self.replication_key]

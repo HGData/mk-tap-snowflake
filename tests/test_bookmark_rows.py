@@ -262,6 +262,16 @@ def test_state_without_a_row_count_reads_the_bookmark_once_more(
     assert ids == []
 
 
+def test_a_date_only_stamp_is_read_at_or_after(warehouse: _Warehouse) -> None:
+    """A row changed in place under a date-only stamp leaves the count the same."""
+    midnight = "2026-11-02T00:00:00.000000+00:00"
+    _load(warehouse, [("c1", midnight), ("c2", midnight)])
+    _, state = _sync(None)
+
+    ids, _ = _sync(state)
+    assert sorted(ids) == ["c1", "c2"]
+
+
 def test_rows_without_a_stamp_are_not_counted(warehouse: _Warehouse) -> None:
     _load(warehouse, [("n1", None), *FIRST_LOAD])
     ids, state = _sync(None)
