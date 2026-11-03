@@ -280,3 +280,16 @@ def test_rows_without_a_stamp_are_not_counted(warehouse: _Warehouse) -> None:
         "replication_key_value": FIRST_STAMP,
         "rows": 3,
     }
+
+
+def test_a_row_record_without_a_count_reads_at_or_after(
+    warehouse: _Warehouse,
+) -> None:
+    """A hand-edited record that lost its row count counts as no record."""
+    _load(warehouse, FIRST_LOAD)
+    _, state = _sync(None)
+    del _stream_state(state)[BOOKMARK_ROWS]["rows"]
+
+    ids, _ = _sync(state)
+    assert sorted(ids) == ["a1", "a2", "a3"]
+

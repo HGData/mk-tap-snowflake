@@ -740,8 +740,9 @@ class SnowflakeStream(SQLStream):
         When the table holds no more rows at that value now, the next read can start
         strictly after it, so a load written under one shared value is read once
         instead of on every run until a newer load lands. A run that stopped
-        part-way, a bookmark edited by hand, or rows added at the value since (a load
-        committed in pieces) read at or after the bookmark.
+        part-way, a bookmark edited by hand, a record without a row count, or rows
+        added at the value since (a load committed in pieces) read at or after the
+        bookmark.
 
         Only a timestamp with a fraction of a second qualifies. A date-only or
         whole-second stamp is shared by rows written at different times, and a row
@@ -757,9 +758,14 @@ class SnowflakeStream(SQLStream):
             True when the rows recorded at the bookmark are all the rows there now.
         """
         recorded = self.get_context_state(context).get(BOOKMARK_ROWS)
-        if not recorded or recorded.get("replication_key_value") != start_val:
+        if not isinstance(recorded, dict):
             return False
-        if not _has_fraction_of_a_second(start_val):
+        recorded_rows = recorded.get("rows")
+        if (
+            recorded.get("replication_key_value") != start_val
+            or not isinstance(recorded_rows, int)
+            or not _has_fraction_of_a_second(start_val)
+        ):
             return False
 
         replication_key_col = table.columns[self.replication_key]
@@ -769,21 +775,21 @@ class SnowflakeStream(SQLStream):
             .where(replication_key_col == start_val)
         )
         rows_now = next(iter(self.connector.execute(count_query)))[0]  # type: ignore[attr-defined]
-        if rows_now > recorded["rows"]:
+        if rows_now > recorded_rows:
             self.logger.info(
                 "Stream '%s': %d rows carry the bookmark %s now, %d when it was read; "
                 "reading at or after it.",
                 self.name,
                 rows_now,
                 start_val,
-                recorded["rows"],
+                recorded_rows,
             )
             return False
 
         self.logger.info(
             "Stream '%s': all %d rows at the bookmark %s were read; reading after it.",
             self.name,
-            recorded["rows"],
+            recorded_rows,
             start_val,
         )
         return True
