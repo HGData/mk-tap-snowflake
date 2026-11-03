@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 from contextlib import redirect_stdout
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -293,3 +294,49 @@ def test_a_row_record_without_a_count_reads_at_or_after(
     ids, _ = _sync(state)
     assert sorted(ids) == ["a1", "a2", "a3"]
 
+
+class _DatetimeRow:
+    """A result row whose `updated_at` is a `datetime`, as Snowflake returns it."""
+
+    def __init__(self, mapping: dict[str, Any]) -> None:
+        self._mapping = mapping
+
+    def __getitem__(self, index: int) -> Any:
+        return list(self._mapping.values())[index]
+
+
+@pytest.mark.parametrize(
+    ("stamp", "kind"),
+    [(FIRST_STAMP, "naive"), ("2026-10-30T05:14:47.572000-07:00", "aware")],
+)
+def test_datetime_values_record_the_sdk_bookmark(
+    warehouse: _Warehouse,
+    monkeypatch: pytest.MonkeyPatch,
+    stamp: str,
+    kind: str,
+) -> None:
+    """Snowflake returns datetimes; the record must match the SDK's bookmark."""
+    read = SnowflakeConnector.execute
+
+    def execute(self: SnowflakeConnector, query: Any) -> _Result:
+        result = read(self, query)
+        rows = []
+        for row in result._rows:
+            mapping = dict(row._mapping)
+            if isinstance(mapping.get("updated_at"), str):
+                value = datetime.fromisoformat(mapping["updated_at"])
+                naive = value.replace(tzinfo=None)
+                mapping["updated_at"] = naive if kind == "naive" else value
+            rows.append(_DatetimeRow(mapping))
+        return _Result(rows, result._stop_after)
+
+    monkeypatch.setattr(SnowflakeConnector, "execute", execute)
+    _load(warehouse, [("a1", stamp), ("a2", stamp)])
+    ids, state = _sync(None)
+    assert sorted(ids) == ["a1", "a2"]
+    stream_state = _stream_state(state)
+    recorded = stream_state[BOOKMARK_ROWS]["replication_key_value"]
+    assert recorded == stream_state["replication_key_value"]
+
+    ids, _ = _sync(state)
+    assert ids == []
