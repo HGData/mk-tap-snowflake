@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from functools import cached_property
 from pathlib import Path
@@ -21,6 +22,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from singer_sdk import metrics
 from singer_sdk.exceptions import ConfigValidationError
+from singer_sdk.helpers._typing import to_json_compatible
 from singer_sdk.sql import SQLConnector, SQLStream
 from singer_sdk.sql.connector import SQLToJSONSchema
 from singer_sdk.streams.core import REPLICATION_FULL_TABLE, REPLICATION_INCREMENTAL
@@ -42,6 +44,20 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Connection, CursorResult
     from sqlalchemy.sql import Executable
     from sqlalchemy.sql.elements import TextClause
+
+# Stream-state key for the value a finished read ended on and how many rows carried
+# it, so the next run can tell whether that value has gained rows since.
+BOOKMARK_ROWS = "bookmark_rows"
+
+
+def _has_fraction_of_a_second(value: object) -> bool:
+    """Return whether a bookmark is a timestamp finer than whole seconds."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).microsecond != 0
+    except ValueError:
+        return False
 
 
 class SnowflakeAuthMethod(Enum):
@@ -712,12 +728,79 @@ class SnowflakeStream(SQLStream):
 
         yield from client.execute_dicts(f"{sql}{clause}")
 
+    def _bookmark_rows_unchanged(
+        self,
+        table: sqlalchemy.Table,
+        start_val: object,
+        context: types.Context | None,
+    ) -> bool:
+        """Return whether every row at the bookmark was read by the run that set it.
+
+        A finished read records the value it ended on and how many rows carried it.
+        When the table holds no more rows at that value now, the next read can start
+        strictly after it, so a load written under one shared value is read once
+        instead of on every run until a newer load lands. A run that stopped
+        part-way, a bookmark edited by hand, a record without a row count, or rows
+        added at the value since (a load committed in pieces) read at or after the
+        bookmark.
+
+        Only a timestamp with a fraction of a second qualifies. A date-only or
+        whole-second stamp is shared by rows written at different times, and a row
+        changed in place at that same value leaves the count unchanged, so those
+        bookmarks keep reading at or after.
+
+        Args:
+            table: The table being read.
+            start_val: The bookmark this run starts from.
+            context: Stream partition or context dictionary.
+
+        Returns:
+            True when the rows recorded at the bookmark are all the rows there now.
+        """
+        recorded = self.get_context_state(context).get(BOOKMARK_ROWS)
+        if not isinstance(recorded, dict):
+            return False
+        recorded_rows = recorded.get("rows")
+        if (
+            recorded.get("replication_key_value") != start_val
+            or not isinstance(recorded_rows, int)
+            or not _has_fraction_of_a_second(start_val)
+        ):
+            return False
+
+        replication_key_col = table.columns[self.replication_key]
+        count_query = (
+            sqlalchemy.select(sqlalchemy.func.count())
+            .select_from(table)
+            .where(replication_key_col == start_val)
+        )
+        rows_now = next(iter(self.connector.execute(count_query)))[0]  # type: ignore[attr-defined]
+        if rows_now > recorded_rows:
+            self.logger.info(
+                "Stream '%s': %d rows carry the bookmark %s now, %d when it was read; "
+                "reading at or after it.",
+                self.name,
+                rows_now,
+                start_val,
+                recorded_rows,
+            )
+            return False
+
+        self.logger.info(
+            "Stream '%s': all %d rows at the bookmark %s were read; reading after it.",
+            self.name,
+            recorded_rows,
+            start_val,
+        )
+        return True
+
     def get_records(self, context: types.Context | None) -> Iterable[dict[str, Any]]:
         """Return a generator of record-type dictionary objects.
 
         If the stream has a replication_key value defined, records will be sorted by the
         incremental key. If the stream also has an available starting bookmark, the
-        records will be filtered for values greater than or equal to the bookmark value.
+        records will be filtered for values greater than the bookmark when every row at
+        the bookmark was already read, and greater than or equal to it otherwise.
 
         Args:
             context: If partition context is provided, will read specifically from this
@@ -751,10 +834,48 @@ class SnowflakeStream(SQLStream):
 
             start_val = self.get_starting_replication_key_value(context)
             if start_val:
-                query = query.where(replication_key_col >= start_val)
+                if self._bookmark_rows_unchanged(table, start_val, context):
+                    query = query.where(replication_key_col > start_val)
+                else:
+                    query = query.where(replication_key_col >= start_val)
 
         if self.ABORT_AT_RECORD_COUNT is not None:
             query = query.limit(self.ABORT_AT_RECORD_COUNT)
 
+        yield from self._read_noting_last_value(query, context)
+
+    def _read_noting_last_value(
+        self,
+        query: Executable,
+        context: types.Context | None,
+    ) -> Iterable[dict[str, Any]]:
+        """Yield the rows of a sorted read, then record its last value and row count.
+
+        The record is written only once the read reaches the end, so a run that stops
+        part-way never vouches for a bookmark whose rows it did not finish reading.
+
+        Args:
+            query: The read, ordered by the replication key.
+            context: Stream partition or context dictionary.
+
+        Yields:
+            One dict per record.
+        """
+        last_value = None
+        rows_at_last_value = 0
         for record in self.connector.execute(query).mappings():  # type: ignore[attr-defined]
-            yield dict(record)
+            row = dict(record)
+            value = row.get(self.replication_key) if self.replication_key else None
+            if value is not None:
+                value = to_json_compatible(value)
+                if value == last_value:
+                    rows_at_last_value += 1
+                else:
+                    last_value, rows_at_last_value = value, 1
+            yield row
+
+        if last_value is not None:
+            self.get_context_state(context)[BOOKMARK_ROWS] = {
+                "replication_key_value": last_value,
+                "rows": rows_at_last_value,
+            }
